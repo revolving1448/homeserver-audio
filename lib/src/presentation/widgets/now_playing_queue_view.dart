@@ -1,6 +1,7 @@
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:jplayer/src/domain/models/models.dart';
 import 'package:jplayer/src/domain/providers/player_bar_provider.dart';
@@ -263,7 +264,27 @@ class _QueueRowState extends ConsumerState<_QueueRow> {
       onTap: (_) => widget.onTap(),
       onLikePressed: (_) => widget.onLikePressed(),
       onRatingChanged: (_, rating) => widget.onRatingChanged(rating),
-      trailing: widget.isDesktop ? null : _optionsButton(),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _optionsButton(),
+          QueueReorderHandle(
+            index: widget.position,
+            label: widget.song.name,
+            onMoveUp: widget.position == 0
+                ? null
+                : () => ref
+                      .read(playbackProvider.notifier)
+                      .moveInQueue(widget.position, widget.position - 1),
+            onMoveDown:
+                widget.position + 1 >= ref.watch(barQueueProvider).length
+                ? null
+                : () => ref
+                      .read(playbackProvider.notifier)
+                      .moveInQueue(widget.position, widget.position + 1),
+          ),
+        ],
+      ),
     );
 
     return GestureDetector(
@@ -272,15 +293,7 @@ class _QueueRowState extends ConsumerState<_QueueRow> {
         position: details.globalPosition,
         actions: _menuActions(context),
       ),
-      child: widget.isDesktop
-          ? ReorderableDragStartListener(
-              index: widget.position,
-              child: row,
-            )
-          : ReorderableDelayedDragStartListener(
-              index: widget.position,
-              child: row,
-            ),
+      child: row,
     );
   }
 
@@ -301,4 +314,45 @@ class _QueueRowState extends ConsumerState<_QueueRow> {
   ];
 
   Widget _optionsButton() => ContextMenuButton(actionsBuilder: _menuActions);
+}
+
+/// A dedicated immediate-drag target keeps queue scrolling and song taps separate.
+class QueueReorderHandle extends StatelessWidget {
+  const QueueReorderHandle({
+    required this.index,
+    required this.label,
+    this.onMoveUp,
+    this.onMoveDown,
+    super.key,
+  });
+
+  final int index;
+  final String label;
+  final VoidCallback? onMoveUp;
+  final VoidCallback? onMoveDown;
+
+  @override
+  Widget build(BuildContext context) => Semantics(
+    label: 'Reorder $label',
+    customSemanticsActions: {
+      if (onMoveUp != null) CustomSemanticsAction(label: 'Move up'): onMoveUp!,
+      if (onMoveDown != null)
+        CustomSemanticsAction(label: 'Move down'): onMoveDown!,
+    },
+    child: Tooltip(
+      message: 'Drag to reorder',
+      excludeFromSemantics: true,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.grab,
+        child: ReorderableDragStartListener(
+          index: index,
+          child: const SizedBox(
+            width: 44,
+            height: 44,
+            child: Icon(Icons.drag_handle, size: 22),
+          ),
+        ),
+      ),
+    ),
+  );
 }

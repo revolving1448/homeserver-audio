@@ -7,7 +7,7 @@ try {
     flutter pub get
     if ($LASTEXITCODE -ne 0) { throw 'Dependency resolution failed' }
     flutter build apk --release --target-platform android-arm64,android-x64 --split-per-abi `
-        --build-number 272 --dart-define=HOMESERVER_PERSONAL=true --dart-define=JELLYBOX_SIDELOAD=true
+        --build-number 273 --dart-define=HOMESERVER_PERSONAL=true --dart-define=JELLYBOX_SIDELOAD=true
     if ($LASTEXITCODE -ne 0) { throw 'Android build failed' }
     Write-Output 'Pixel/GrapheneOS: use build/app/outputs/flutter-apk/app-arm64-v8a-release.apk. Device playback still requires verification.'
 } finally { Pop-Location }
