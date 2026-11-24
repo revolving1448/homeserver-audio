@@ -15,6 +15,8 @@ jobs:
   build:
     runs-on: macos-15-intel
     timeout-minutes: 40
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -22,6 +24,10 @@ jobs:
           flutter-version: 3.47.9
           channel: stable
           cache: true
+      - name: Verify Apple SDK selection
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
       - name: Prepare and build the personal app
         run: bash tool/build_homeserver_ios.sh
       - name: Package for free-account re-signing
