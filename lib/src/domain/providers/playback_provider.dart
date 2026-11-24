@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:jplayer/main.dart';
 import 'package:jplayer/src/core/audio/quality_extras.dart';
+import 'package:jplayer/src/core/cast/remote_cast_gateway.dart';
 import 'package:jplayer/src/core/audio/stream_preference.dart';
 import 'package:jplayer/src/core/audio/stream_target_profile.dart';
 import 'package:jplayer/src/data/backend/media_server_client.dart';
@@ -1061,6 +1062,14 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
           : await proxy.forLocation(location);
       if (artUri != null) artUri = await proxy.resolve(artUri);
       if (Platform.isAndroid) artUri = androidCoverArtUri(artUri);
+    }
+
+    if (target.kind == PlaybackTargetKind.cast) {
+      final castLinks = await _ref
+          .read(remoteCastGatewayProvider)
+          .resolve(uri, artUri);
+      uri = castLinks.mediaUri;
+      artUri = castLinks.artUri;
     }
 
     final extras = <String, dynamic>{
