@@ -1,0 +1,311 @@
+import 'package:flutter/cupertino.dart';
+import 'package:go_router/go_router.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/domain/models/models.dart' hide LibraryPage;
+import 'package:jplayer/src/presentation/pages/pages.dart';
+import 'package:jplayer/src/presentation/tv/pages/tv_now_playing_page.dart';
+import 'package:optional_features/catalog.dart';
+
+class ScreenFactory {
+  const ScreenFactory();
+
+  @protected
+  LibraryItem itemParam(GoRouterState router, String key) {
+    final params = router.extra! as Map<String, dynamic>;
+    final value = params[key];
+    return value is LibraryItem
+        ? value
+        : LibraryItem.fromJson(value as Map<String, dynamic>);
+  }
+
+  static LocalKey _pageKey(GoRouterState router, String kind, String id) =>
+      ValueKey('${router.pageKey.value}:$kind:$id');
+
+  Page<void> albumPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    final album = params['album'] is LibraryItem
+        ? params['album'] as LibraryItem
+        : LibraryItem.fromJson(params['album'] as Map<String, dynamic>);
+
+    return CupertinoPage(
+      key: _pageKey(router, 'album', album.id),
+      child: AlbumPage(album: album),
+    );
+  }
+
+  Page<void> artistPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    final artist = params['artist'] is LibraryItem
+        ? params['artist'] as LibraryItem
+        : LibraryItem.fromJson(params['artist'] as Map<String, dynamic>);
+
+    return CupertinoPage(
+      key: _pageKey(router, 'artist', artist.id),
+      child: ArtistPage(artist: artist),
+    );
+  }
+
+  Page<void> catalogArtistPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    return CupertinoPage(
+      child: CatalogArtistPage(artist: params['artist'] as CatalogArtist),
+    );
+  }
+
+  Page<void> catalogAlbumPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    return CupertinoPage(
+      child: CatalogAlbumPage(album: params['album'] as CatalogAlbum),
+    );
+  }
+
+  Page<void> genrePage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    final genre = params['genre'] is LibraryItem
+        ? params['genre'] as LibraryItem
+        : LibraryItem.fromJson(params['genre'] as Map<String, dynamic>);
+
+    return CupertinoPage(
+      key: _pageKey(router, 'genre', genre.id),
+      child: GenreAlbumsPage(genre: genre),
+    );
+  }
+
+  Page<void> generatedPlaylistPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    final playlist = params['playlist'] is LibraryItem
+        ? params['playlist'] as LibraryItem
+        : LibraryItem.fromJson(params['playlist'] as Map<String, dynamic>);
+
+    return CupertinoPage(
+      key: _pageKey(router, 'generated-playlist', playlist.id),
+      child: GeneratedPlaylistPage(playlist: playlist),
+    );
+  }
+
+  Page<void> instantMixPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    final mix = params['mix'] is LibraryItem
+        ? params['mix'] as LibraryItem
+        : LibraryItem.fromJson(params['mix'] as Map<String, dynamic>);
+
+    return CupertinoPage(
+      key: _pageKey(router, 'mix', mix.id),
+      child: InstantMixPage(mix: mix),
+    );
+  }
+
+  Page<void> downloadsPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: DownloadsPage(),
+    );
+  }
+
+  Page<void> initialPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: InitialPage(),
+    );
+  }
+
+  Page<void> libraryPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: LibraryPage(),
+    );
+  }
+
+  Page<void> browsePage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: BrowsePage(),
+    );
+  }
+
+  Page<void> favouritesPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: FavouritesPage(),
+    );
+  }
+
+  Page<void> favouriteSongsPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: FavouriteSongsPage(),
+    );
+  }
+
+  Page<void> onRepeatPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: OnRepeatPage(),
+    );
+  }
+
+  Page<void> homePage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: HomePage(),
+    );
+  }
+
+  Page<void> loginPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: LoginPage(),
+    );
+  }
+
+  Page<void> addServerPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: LoginPage(addingServer: true),
+    );
+  }
+
+  Page<void> nowPlayingPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: TvNowPlayingPage(),
+    );
+  }
+
+  Page<void> mainPage(
+    BuildContext context,
+    GoRouterState router,
+    StatefulNavigationShell shell,
+  ) {
+    return CupertinoPage(
+      child: MainPage(shell: shell),
+    );
+  }
+
+  Page<void> queueCachePage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: QueueCachePage(),
+    );
+  }
+
+  Page<void> devQueuesPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: DevQueuesPage(),
+    );
+  }
+
+  Page<void> palettePage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: ColorPalettePage(),
+    );
+  }
+
+  Page<void> playlistPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+    final playlist = params['playlist'] is LibraryItem
+        ? params['playlist'] as LibraryItem
+        : LibraryItem.fromJson(params['playlist'] as Map<String, dynamic>);
+
+    return CupertinoPage(
+      key: _pageKey(router, 'playlist', playlist.id),
+      child: PlaylistPage(playlist: playlist),
+    );
+  }
+
+  Page<void> searchResultsPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final params = router.extra! as Map<String, dynamic>;
+
+    return CupertinoPage(
+      child: SearchResultsPage(category: params['category'] as ItemList),
+    );
+  }
+
+  Page<void> settingsPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const NoTransitionPage(
+      child: SettingsPage(),
+    );
+  }
+
+  Page<void> settingsSectionPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    final section =
+        SettingsSection.byName(router.pathParameters['section']) ??
+        SettingsSection.servers;
+    return CupertinoPage(
+      key: ValueKey(section),
+      child: SettingsSectionPage(section: section),
+    );
+  }
+
+  Page<void> supportPage(
+    BuildContext context,
+    GoRouterState router,
+  ) {
+    return const CupertinoPage(
+      child: SupportPage(),
+    );
+  }
+}

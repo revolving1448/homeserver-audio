@@ -1,0 +1,19 @@
+import 'package:freezed_annotation/freezed_annotation.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+
+part 'filter.freezed.dart';
+
+@freezed
+abstract class Filter with _$Filter {
+  const factory Filter({
+    required EntityFilter orderBy,
+    @Default(false) bool desc,
+  }) = _Filter;
+}
+
+extension FilterSelect on Filter {
+  Filter select(EntityFilter next) =>
+      next == orderBy && next != EntityFilter.rating
+      ? copyWith(desc: !desc)
+      : Filter(orderBy: next, desc: next.defaultDescending);
+}

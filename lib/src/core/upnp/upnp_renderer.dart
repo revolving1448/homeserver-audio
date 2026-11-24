@@ -1,0 +1,267 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
+import 'package:jplayer/src/core/diagnostics/diagnostics.dart';
+import 'package:jplayer/src/core/upnp/av_transport.dart';
+import 'package:jplayer/src/core/upnp/connection_manager.dart';
+import 'package:jplayer/src/core/upnp/rendering_control.dart';
+import 'package:jplayer/src/core/upnp/ssdp_discovery.dart';
+import 'package:jplayer/src/core/upnp/upnp_device.dart';
+import 'package:jplayer/src/core/upnp/upnp_soap_client.dart';
+import 'package:optional_features/upnp_quirks.dart';
+
+class UpnpRenderer {
+  const UpnpRenderer({
+    required this.device,
+    required this.avTransport,
+    this.renderingControl,
+    this.sinkMimeTypes = const <String>{},
+    this.fingerprint = const DeviceFingerprint(),
+    this.quirks = DeviceQuirks.defaults,
+    this.queueDriver,
+    this.groups,
+  });
+
+  final UpnpDevice device;
+  final AvTransport avTransport;
+  final RenderingControl? renderingControl;
+  final Set<String> sinkMimeTypes;
+  final DeviceFingerprint fingerprint;
+  final DeviceQuirks quirks;
+  final DeviceQueue? queueDriver;
+  final SpeakerGroups? groups;
+
+  Set<String> get playableMimeTypes => quirks.playableMimeTypes(sinkMimeTypes);
+
+  DeviceQueueKind get queueKind =>
+      quirks.queueOverride ?? detectQueue(fingerprint);
+
+  bool get holdsQueue => queueDriver != null;
+
+  bool get isGroupable => groups != null;
+
+  Uri? get iconUrl => device.iconUrl;
+
+  String get id => device.udn;
+
+  String get name => device.displayName;
+
+  String? get model => device.modelName;
+
+  String get host => device.host;
+}
+
+class UpnpControlPoint {
+  UpnpControlPoint({
+    Dio? dio,
+    SsdpDiscovery? discovery,
+    UpnpSoapClient? soap,
+    Diagnostics diagnostics = const Diagnostics(),
+  }) : _dio = dio ?? Dio(),
+       _discovery = discovery ?? SsdpDiscovery(),
+       _soap = soap ?? UpnpSoapClient(dio: dio),
+       _diagnostics = diagnostics;
+
+  final Dio _dio;
+  final SsdpDiscovery _discovery;
+  final UpnpSoapClient _soap;
+  final Diagnostics _diagnostics;
+
+  Stream<UpnpRenderer> discoverRenderers({
+    Duration timeout = const Duration(seconds: 4),
+  }) {
+    final controller = StreamController<UpnpRenderer>();
+    final described = <String>{};
+    var pending = 0;
+    var searching = true;
+
+    void maybeClose() {
+      if (!searching && pending == 0 && !controller.isClosed) {
+        unawaited(controller.close());
+      }
+    }
+
+    final subscription = _discovery
+        .search(timeout: timeout)
+        .listen(
+          (response) {
+            if (!described.add('${response.location}')) return;
+            pending++;
+            unawaited(
+              describe(response.location)
+                  .then((renderer) {
+                    if (renderer != null && !controller.isClosed) {
+                      controller.add(renderer);
+                    }
+                  })
+                  .whenComplete(() {
+                    pending--;
+                    maybeClose();
+                  }),
+            );
+          },
+          onDone: () {
+            searching = false;
+            maybeClose();
+          },
+          onError: (Object _) {
+            searching = false;
+            maybeClose();
+          },
+        );
+
+    controller.onCancel = () async {
+      searching = false;
+      await subscription.cancel();
+    };
+
+    return controller.stream;
+  }
+
+  Future<UpnpRenderer?> describe(Uri location) async {
+    final device = await _fetchDevice(location);
+    if (device == null) return null;
+
+    final transportService = device.serviceOfType('AVTransport');
+    if (transportService == null) return null;
+
+    final actions = await _fetchActions(transportService.scpdUrl);
+    final renderingService = device.serviceOfType('RenderingControl');
+    final connectionService = device.serviceOfType('ConnectionManager');
+    final sinkMimeTypes = connectionService == null
+        ? const <String>{}
+        : await _fetchSinkMimeTypes(connectionService.controlUrl);
+
+    final fingerprint = DeviceFingerprint(
+      manufacturer: device.manufacturer,
+      modelName: device.modelName,
+      modelNumber: device.modelNumber,
+      deviceType: device.deviceType,
+      friendlyName: device.friendlyName,
+      softwareGeneration: device.softwareGeneration,
+      actions: actions,
+      sinkMimeTypes: sinkMimeTypes,
+      services: {for (final service in device.services) service.type},
+    );
+    final quirks = quirksFor(fingerprint);
+    final kind = quirks.queueOverride ?? detectQueue(fingerprint);
+    final rules = rulesFor(fingerprint).map((rule) => rule.name).toList();
+    final context = _context(device, transportService);
+    final queueDriver = buildDeviceQueue(kind, context);
+
+    _diagnostics.trail(
+      'renderer described: ${device.manufacturer ?? 'unknown maker'} '
+      '${device.modelName ?? 'unknown model'}, queue ${kind.name} '
+      '${queueDriver == null ? 'without' : 'with'} a driver, rules $rules, '
+      'next-URI ${actions.contains('SetNextAVTransportURI') ? 'yes' : 'no'}, '
+      'services ${device.services.map((s) => s.shortType).toList()}',
+      category: 'upnp',
+      data: {
+        ...fingerprint.redacted().toJson(),
+        'quirks': quirks.toJson(),
+        'queue': kind.name,
+        'rules': rules,
+      },
+    );
+
+    return UpnpRenderer(
+      queueDriver: queueDriver,
+      groups: buildSpeakerGroups(fingerprint, context),
+      device: device,
+      avTransport: AvTransport(
+        soap: _soap,
+        controlUrl: transportService.controlUrl,
+        actions: actions,
+      ),
+      renderingControl: renderingService == null
+          ? null
+          : RenderingControl(
+              soap: _soap,
+              controlUrl: renderingService.controlUrl,
+            ),
+      sinkMimeTypes: sinkMimeTypes,
+      fingerprint: fingerprint,
+      quirks: quirks,
+    );
+  }
+
+  DeviceQueueContext _context(UpnpDevice device, UpnpService transport) =>
+      DeviceQueueContext(
+        udn: device.udn,
+        transportControlUrl: transport.controlUrl,
+        controlUrls: {
+          for (final service in device.services)
+            service.shortType: service.controlUrl,
+        },
+        invoke: (controlUrl, serviceType, action, arguments) => _soap.invoke(
+          controlUrl: controlUrl,
+          serviceType: serviceType,
+          action: action,
+          arguments: arguments,
+        ),
+        log: (message) => _diagnostics.trail(message, category: 'upnp'),
+      );
+
+  Future<UpnpDevice?> _fetchDevice(Uri location) async {
+    try {
+      final response = await _dio.getUri<String>(
+        location,
+        options: Options(
+          responseType: ResponseType.plain,
+          receiveTimeout: const Duration(seconds: 5),
+        ),
+      );
+      final body = response.data;
+      if (body == null) return null;
+      return UpnpDevice.parse(body, location: location);
+    } on Object catch (error) {
+      _diagnostics.trail(
+        'device description failed for ${location.host}: ${_brief(error)}',
+        category: 'upnp',
+        data: {'error': '$error'},
+      );
+      return null;
+    }
+  }
+
+  static String _brief(Object error) =>
+      error is DioException ? error.type.name : '$error';
+
+  Future<Set<String>> _fetchActions(Uri? scpdUrl) async {
+    if (scpdUrl == null) return const {};
+    try {
+      final response = await _dio.getUri<String>(
+        scpdUrl,
+        options: Options(
+          responseType: ResponseType.plain,
+          receiveTimeout: const Duration(seconds: 5),
+        ),
+      );
+      final body = response.data;
+      return body == null ? const {} : parseScpdActions(body);
+    } on Object catch (error) {
+      _diagnostics.trail(
+        'service description failed: $error',
+        category: 'upnp',
+        data: {'error': '$error'},
+      );
+      return const {};
+    }
+  }
+
+  Future<Set<String>> _fetchSinkMimeTypes(Uri controlUrl) async {
+    try {
+      return await ConnectionManager(
+        soap: _soap,
+        controlUrl: controlUrl,
+      ).sinkMimeTypes();
+    } on Object catch (error) {
+      _diagnostics.trail(
+        'GetProtocolInfo failed: $error',
+        category: 'upnp',
+        data: {'error': '$error'},
+      );
+      return const {};
+    }
+  }
+}

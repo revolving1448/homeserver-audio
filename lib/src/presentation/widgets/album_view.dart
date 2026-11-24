@@ -1,0 +1,231 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/resources/resources.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/playback_provider.dart';
+import 'package:jplayer/src/presentation/widgets/circle_play_button.dart';
+import 'package:jplayer/src/presentation/widgets/context_menu.dart';
+import 'package:jplayer/src/presentation/widgets/download_badge_icon.dart';
+import 'package:jplayer/src/presentation/widgets/now_playing_glow.dart';
+import 'package:jplayer/src/providers/image_service_provider.dart';
+import 'package:responsive_builder/responsive_builder.dart';
+
+class AlbumView extends ConsumerStatefulWidget {
+  const AlbumView({
+    required this.album,
+    this.onTap,
+    this.onPlayPressed,
+    this.optionsBuilder,
+    this.mainTextStyle,
+    this.subTextStyle,
+    this.showArtist = true,
+    this.subtitle,
+    this.trailing,
+    this.alignTextStart = false,
+    this.coverOverride,
+    this.showDownloadBadge = true,
+    super.key,
+  });
+
+  static const coverTextSpacing = 6.0;
+  static const titleFontSize = 16.0;
+  static const subtitleFontSize = 14.0;
+
+  final LibraryItem album;
+  final bool showArtist;
+  final void Function(LibraryItem)? onTap;
+  final Future<void> Function(LibraryItem)? onPlayPressed;
+  final List<ContextMenuAction> Function(BuildContext)? optionsBuilder;
+  final TextStyle? mainTextStyle;
+  final TextStyle? subTextStyle;
+
+  final String? subtitle;
+
+  final Widget? trailing;
+  final bool alignTextStart;
+
+  final Widget? coverOverride;
+
+  final bool showDownloadBadge;
+
+  @override
+  ConsumerState<AlbumView> createState() => _AlbumViewState();
+}
+
+class _AlbumViewState extends ConsumerState<AlbumView> {
+  var _isHovered = false;
+  var _isPlayLoading = false;
+
+  ImageProvider get _libraryImage =>
+      ref.read(imageServiceProvider).itemImage(widget.album);
+
+  String get _subtitleText =>
+      widget.subtitle ??
+      (widget.showArtist ? (widget.album.albumArtist ?? '') : '');
+
+  Future<void> _onPlayPressed() async {
+    final onPlayPressed = widget.onPlayPressed;
+    if (onPlayPressed == null || _isPlayLoading) return;
+    final toggled = toggleQueueSource(ref, widget.album.id);
+    if (toggled != null) return toggled;
+    setState(() => _isPlayLoading = true);
+    try {
+      await onPlayPressed(widget.album);
+    } finally {
+      if (mounted) setState(() => _isPlayLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDesktop =
+        getDeviceType(MediaQuery.sizeOf(context)) == DeviceScreenType.desktop;
+
+    final card = GestureDetector(
+      onLongPress: (!isDesktop && widget.optionsBuilder != null)
+          ? () => showLongPressContextMenuSheet(
+              context,
+              actions: widget.optionsBuilder!(context),
+            )
+          : null,
+      onTap: (widget.onTap != null)
+          ? () => widget.onTap!.call(widget.album)
+          : null,
+      onSecondaryTapUp: widget.optionsBuilder != null
+          ? (details) => showContextMenu(
+              context,
+              position: details.globalPosition,
+              actions: widget.optionsBuilder!(context),
+            )
+          : null,
+      behavior: HitTestBehavior.opaque,
+      child: Column(
+        crossAxisAlignment: widget.alignTextStart
+            ? CrossAxisAlignment.start
+            : CrossAxisAlignment.center,
+        spacing: AlbumView.coverTextSpacing,
+        children: [
+          Flexible(
+            child: AspectRatio(
+              aspectRatio: 1,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  NowPlayingGlow(
+                    item: widget.album,
+                    borderRadius: BorderRadius.circular(12),
+                    child:
+                        widget.coverOverride ??
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image(
+                            image: _libraryImage,
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) =>
+                                Image.asset(Images.album, fit: BoxFit.cover),
+                          ),
+                        ),
+                  ),
+                  if (widget.showDownloadBadge)
+                    Positioned(
+                      top: 8,
+                      left: 8,
+                      child: DownloadBadgeIcon(item: widget.album),
+                    ),
+                  if (widget.onPlayPressed != null)
+                    Positioned(
+                      right: 8,
+                      bottom: 8,
+                      child: _playButton(40),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          if (widget.trailing != null)
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: widget.alignTextStart
+                        ? CrossAxisAlignment.start
+                        : CrossAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [_titleText(), _subtitleWidget()],
+                  ),
+                ),
+                widget.trailing!,
+              ],
+            )
+          else
+            Column(
+              crossAxisAlignment: widget.alignTextStart
+                  ? CrossAxisAlignment.start
+                  : CrossAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [_titleText(), _subtitleWidget()],
+            ),
+        ],
+      ),
+    );
+
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: AnimatedScale(
+        scale: _isHovered ? 1.04 : 1,
+        duration: const Duration(milliseconds: 150),
+        curve: Curves.easeOut,
+        child: card,
+      ),
+    );
+  }
+
+  Widget _titleText() => Text(
+    widget.album.name,
+    style: const TextStyle(
+      fontSize: AlbumView.titleFontSize,
+      fontWeight: FontWeight.w500,
+      height: 1.2,
+      overflow: TextOverflow.ellipsis,
+    ).merge(widget.mainTextStyle),
+    maxLines: 1,
+  );
+
+  Widget _subtitleWidget() => Text(
+    _subtitleText,
+    style: const TextStyle(
+      fontSize: AlbumView.subtitleFontSize,
+      fontWeight: FontWeight.w400,
+      height: 1.2,
+      color: Color.fromARGB(130, 255, 255, 255),
+      overflow: TextOverflow.ellipsis,
+    ).merge(widget.subTextStyle),
+    maxLines: 1,
+  );
+
+  bool get _isSourcePlaying => switch (ref.watch(
+    queueSourceStatus(widget.album.id),
+  )) {
+    PlaybackStatus.playing || PlaybackStatus.buffering => true,
+    _ => false,
+  };
+
+  Widget _playButton(double size) {
+    final isVisible = _isHovered || _isPlayLoading || _isSourcePlaying;
+
+    return IgnorePointer(
+      ignoring: !isVisible,
+      child: AnimatedOpacity(
+        opacity: isVisible ? 1 : 0,
+        duration: const Duration(milliseconds: 150),
+        child: CirclePlayButton(
+          size: size,
+          isLoading: _isPlayLoading,
+          isPlaying: _isSourcePlaying,
+          onPressed: _onPlayPressed,
+        ),
+      ),
+    );
+  }
+}

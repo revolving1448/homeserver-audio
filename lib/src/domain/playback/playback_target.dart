@@ -1,0 +1,161 @@
+import 'package:jplayer/src/core/audio/stream_target_profile.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+
+enum PlaybackTargetKind { local, upnp, cast }
+
+class TargetTrack {
+  const TargetTrack({
+    required this.itemId,
+    required this.uri,
+    required this.mimeType,
+    required this.isHls,
+    required this.title,
+    required this.duration,
+    this.location,
+    this.artist,
+    this.album,
+    this.artUri,
+    this.transcoded = false,
+    this.extras = const <String, dynamic>{},
+  });
+
+  final String itemId;
+  final Uri uri;
+  final Uri? location;
+  final String mimeType;
+  final bool isHls;
+  final String title;
+  final Duration duration;
+  final String? artist;
+  final String? album;
+  final Uri? artUri;
+  final bool transcoded;
+  final Map<String, dynamic> extras;
+
+  bool get isLocalFile => uri.isScheme('file');
+}
+
+class TargetPlaybackState {
+  const TargetPlaybackState({
+    required this.status,
+    required this.position,
+    this.currentIndex,
+    this.duration,
+    this.bufferedPosition,
+    this.canSeek = true,
+    this.completed = false,
+    this.takenOver = false,
+  });
+
+  static const idle = TargetPlaybackState(
+    status: PlaybackStatus.stopped,
+    position: Duration.zero,
+  );
+
+  final PlaybackStatus status;
+  final Duration position;
+  final int? currentIndex;
+  final Duration? duration;
+  final Duration? bufferedPosition;
+  final bool canSeek;
+  final bool completed;
+  final bool takenOver;
+
+  TargetPlaybackState copyWith({
+    PlaybackStatus? status,
+    Duration? position,
+    int? currentIndex,
+    Duration? duration,
+    Duration? bufferedPosition,
+    bool? canSeek,
+    bool? completed,
+    bool? takenOver,
+  }) => TargetPlaybackState(
+    status: status ?? this.status,
+    position: position ?? this.position,
+    currentIndex: currentIndex ?? this.currentIndex,
+    duration: duration ?? this.duration,
+    bufferedPosition: bufferedPosition ?? this.bufferedPosition,
+    canSeek: canSeek ?? this.canSeek,
+    completed: completed ?? this.completed,
+    takenOver: takenOver ?? this.takenOver,
+  );
+}
+
+abstract class PlaybackTarget {
+  String get id;
+
+  String get name;
+
+  PlaybackTargetKind get kind;
+
+  StreamTargetProfile get streamProfile;
+
+  bool get supportsLocalFiles;
+
+  TargetPlaybackState get state;
+
+  Stream<TargetPlaybackState> get stateStream;
+
+  Future<void> load(
+    List<TargetTrack> tracks, {
+    required int initialIndex,
+    required Duration initialPosition,
+    required bool autoPlay,
+  });
+
+  Future<void> play();
+
+  Future<void> pause();
+
+  Future<void> stop();
+
+  Future<void> seek(Duration position);
+
+  Future<void> skipTo(int index);
+
+  Future<void> move(int from, int to);
+
+  Future<void> remove(int index);
+
+  Future<void> insert(int index, TargetTrack track, {bool playNext = false});
+
+  Future<void> insertAll(
+    int index,
+    List<TargetTrack> tracks, {
+    bool playNext = false,
+  });
+
+  Future<void> replaceAroundCurrent(
+    int currentIndex,
+    List<TargetTrack> upcoming,
+  );
+
+  Future<void> reorder(
+    List<TargetTrack> tracks, {
+    required List<int> order,
+    required int currentIndex,
+  });
+
+  Future<void> seekToNext();
+
+  Future<void> seekToPrevious();
+
+  Future<void> setVolume(double level);
+
+  Future<double?> currentVolume();
+
+  Future<void> dispose();
+}
+
+mixin SwappableQueue implements PlaybackTarget {
+  Future<void> replace(int index, TargetTrack track);
+
+  bool get holdsCurrentTrack => true;
+}
+
+typedef TrackLoadFailure = ({String? itemId, int index, int attempt});
+
+mixin LoadFailureReporting implements PlaybackTarget {
+  Stream<TrackLoadFailure> get loadFailures;
+}

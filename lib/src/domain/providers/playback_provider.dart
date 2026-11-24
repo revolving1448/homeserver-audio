@@ -1,0 +1,2083 @@
+import 'dart:async';
+
+import 'dart:io' show Platform;
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/main.dart';
+import 'package:jplayer/src/core/audio/quality_extras.dart';
+import 'package:jplayer/src/core/audio/stream_preference.dart';
+import 'package:jplayer/src/core/audio/stream_target_profile.dart';
+import 'package:jplayer/src/data/backend/media_server_client.dart';
+import 'package:jplayer/src/data/backend/playback_report.dart';
+import 'package:jplayer/src/data/providers/providers.dart';
+import 'package:jplayer/src/data/storages/cast_session_storage.dart';
+import 'package:jplayer/src/data/storages/playback_storage.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/core/android_auto/cover_art_uri.dart';
+import 'package:jplayer/src/domain/playback/cast_session_resume.dart';
+import 'package:jplayer/src/domain/playback/play_request.dart';
+import 'package:jplayer/src/domain/playback/playback_target.dart';
+import 'package:jplayer/src/domain/playback/upnp_playback_target.dart';
+import 'package:jplayer/src/domain/providers/app_settings_provider.dart';
+import 'package:jplayer/src/domain/providers/cast_failure_provider.dart';
+import 'package:jplayer/src/domain/providers/current_library_provider.dart';
+import 'package:jplayer/src/domain/playback/playback_target_provider.dart';
+import 'package:jplayer/src/domain/providers/pending_media_play_provider.dart';
+import 'package:jplayer/src/domain/providers/resume_points_provider.dart';
+import 'package:jplayer/src/domain/providers/review_prompt_provider.dart';
+import 'package:jplayer/src/domain/providers/stream_preference_provider.dart';
+import 'package:jplayer/src/domain/providers/volume_provider.dart';
+import 'package:jplayer/src/providers/base_url_provider.dart';
+import 'package:jplayer/src/providers/connectivity_provider.dart';
+import 'package:jplayer/src/providers/current_server_id_provider.dart';
+import 'package:jplayer/src/providers/image_service_provider.dart';
+import 'package:jplayer/src/providers/network_type_provider.dart';
+
+class PlaybackNotifier extends StateNotifier<PlaybackState> {
+  PlaybackNotifier(
+    this._ref, {
+    this.queueEditTimeout = const Duration(seconds: 15),
+  }) : super(PlaybackState.initial()) {
+    _target = _destination = _ref.read(playbackTargetProvider);
+    _listenToTarget();
+    _ref.listen<PlaybackTarget>(playbackTargetProvider, (_, next) {
+      if (next.id != _destination.id) _queueSwitch(next, carryQueue: true);
+    });
+    _ref.listen<StreamPreference>(activeStreamPreferenceProvider, (
+      previous,
+      next,
+    ) {
+      if (previous != next) _scheduleRequalify();
+    });
+    _ref.listen<String?>(baseUrlProvider, (previous, next) {
+      if (_target.kind == PlaybackTargetKind.local) return;
+      if (previous != null && next != null && previous != next) {
+        _scheduleRequalify();
+      }
+    });
+    _ref.listen<bool>(manualOfflineProvider, (previous, next) {
+      if (next && previous != next) unawaited(dropStreams());
+    });
+  }
+
+  Future<void> dropStreams() async {
+    final current = state.currentMediaIndex;
+    final playing = current == null ? null : _tracks.elementAtOrNull(current);
+    if (playing != null && !playing.isLocalFile) await stop();
+    for (var index = _tracks.length - 1; index >= 0; index--) {
+      if (_tracks[index].isLocalFile) continue;
+      await removeFromQueue(index);
+    }
+  }
+
+  void _scheduleRequalify() {
+    _requalifyDebounce?.cancel();
+    _requalifyDebounce = Timer(
+      requalifyDelay,
+      () => unawaited(requalifyStreams()),
+    );
+  }
+
+  @visibleForTesting
+  static Duration requalifyDelay = const Duration(seconds: 2);
+
+  @visibleForTesting
+  static Duration progressInterval = const Duration(seconds: 10);
+
+  @visibleForTesting
+  static Duration pausedIdleTimeout = const Duration(minutes: 5);
+  static const _stallSlack = Duration(seconds: 1);
+  static const _stallGrace = Duration(seconds: 6);
+
+  final Ref _ref;
+  final Duration queueEditTimeout;
+  final _playSessionIds = <String, String>{};
+  final _localSongIds = <String>{};
+  final _streamFallbackIds = <String>{};
+  final _tracks = <TargetTrack>[];
+  List<String>? _unshuffledOrder;
+  var _queueDirty = true;
+  String? _queueSavedFor;
+  Future<void> _swaps = Future<void>.value();
+  late PlaybackTarget _target;
+  late PlaybackTarget _destination;
+  Future<void> _switching = Future<void>.value();
+  StreamSubscription<TargetPlaybackState>? _targetSubscription;
+  StreamSubscription<TrackLoadFailure>? _loadFailureSubscription;
+  TargetPlaybackState _targetState = TargetPlaybackState.idle;
+  DateTime? _lastPositionSave;
+  String? _resumePointKey;
+  String? _resumePointSong;
+  String? _queueLibraryId;
+  DateTime? _lastResumePointSave;
+  static const _resumePointInterval = Duration(seconds: 15);
+  int? _reportedIndex;
+  var _reportedPositionMs = 0;
+  var _startReported = false;
+  var _preparingQueue = false;
+  var _queueGeneration = 0;
+  var _queueEditsInFlight = 0;
+  Completer<void>? _queueEditsSettled;
+  var _fallingBack = false;
+  var _recoveringLostCache = false;
+  int? _stallBufferedMs;
+  int? _stallIndex;
+  DateTime? _stalledSince;
+  var _stallLogged = false;
+  Timer? _progressTimer;
+  Timer? _pausedIdleTimer;
+  Future<void>? _lastReport;
+  Timer? _requalifyDebounce;
+  var _requalifyGeneration = 0;
+
+  RemotePlayback? remote;
+  var _localPlays = 0;
+
+  Future<void> playingHere(Future<void> Function() action) async {
+    _localPlays++;
+    try {
+      await action();
+    } finally {
+      _localPlays--;
+    }
+  }
+
+  @override
+  set state(PlaybackState value) {
+    final current = state;
+    if (value.songs != current.songs ||
+        value.album != current.album ||
+        value.sourceId != current.sourceId ||
+        value.shuffleEnabled != current.shuffleEnabled) {
+      _queueDirty = true;
+    }
+    super.state = value;
+  }
+
+  PlaybackTarget get target => _target;
+
+  bool get supportsLocalFiles => _target.supportsLocalFiles;
+
+  StreamTargetProfile _streamProfileFor(PlaybackTarget target) =>
+      target.kind == PlaybackTargetKind.local
+      ? target.streamProfile.withPreference(
+          _ref.read(activeStreamPreferenceProvider),
+        )
+      : target.streamProfile;
+
+  LibraryItem? get _reportedSong {
+    final index = _reportedIndex;
+    return index != null ? state.songs.elementAtOrNull(index) : null;
+  }
+
+  void _onTargetFailure() {
+    if (_target.kind == PlaybackTargetKind.local) {
+      if (state.status == PlaybackStatus.error) return;
+      if (_recoveringLostCache) return;
+      final index = state.currentMediaIndex;
+      final song = index != null ? state.songs.elementAtOrNull(index) : null;
+      final album = state.album;
+      if (song != null &&
+          album != null &&
+          _localSongIds.contains(song.id) &&
+          !_ref.read(isOfflineProvider) &&
+          !_ref.read(manualOfflineProvider)) {
+        _recoveringLostCache = true;
+        unawaited(_recoverFromLostCache(song, album));
+        return;
+      }
+      state = state.copyWith(status: PlaybackStatus.error);
+      return;
+    }
+    if (_fallingBack) return;
+    _fallingBack = true;
+    _ref
+        .read(castFailureProvider.notifier)
+        .report(_target.name, takenOver: _targetState.takenOver);
+    _ref.read(playbackTargetProvider.notifier).useLocal();
+  }
+
+  Future<void> _recoverFromLostCache(
+    LibraryItem song,
+    LibraryItem album,
+  ) async {
+    try {
+      if ((await _cachedPaths([song])).containsKey(song.id)) {
+        state = state.copyWith(status: PlaybackStatus.error);
+        return;
+      }
+      _localSongIds.remove(song.id);
+      try {
+        await _ref.read(queueCacheDatabaseProvider).delete(song.id);
+      } on Object catch (error) {
+        debugPrint('[Playback] dropping a lost cache row failed: $error');
+      }
+      debugPrint('[Playback] "${song.name}" lost its cached file; restreaming');
+      await play(
+        song,
+        state.songs,
+        album,
+        initialPosition: state.position,
+        reshuffle: false,
+      );
+    } on Object catch (error) {
+      debugPrint('[Playback] recovering a lost cached file failed: $error');
+      state = state.copyWith(status: PlaybackStatus.error);
+    } finally {
+      _recoveringLostCache = false;
+    }
+  }
+
+  void _checkForStall(TargetPlaybackState targetState) {
+    final index = targetState.currentIndex;
+    if (index != _stallIndex) {
+      _stallIndex = index;
+      _stallBufferedMs = null;
+      _stalledSince = null;
+      _stallLogged = false;
+    }
+
+    if (_target.kind != PlaybackTargetKind.local) return;
+    if (_preparingQueue) return;
+    if (!targetState.status.isPlaying) return;
+
+    final buffered = targetState.bufferedPosition;
+    if (buffered == null || index == null) return;
+
+    final track = _tracks.elementAtOrNull(index);
+    if (track == null || track.isLocalFile) return;
+
+    final bufferedMs = buffered.inMilliseconds;
+    final grew = _stallBufferedMs == null || bufferedMs > _stallBufferedMs!;
+    _stallBufferedMs = bufferedMs;
+
+    if (grew || targetState.position <= buffered + _stallSlack) {
+      _stalledSince = null;
+      _stallLogged = false;
+      return;
+    }
+
+    if (_stallLogged) return;
+    final since = _stalledSince ??= DateTime.now();
+    if (DateTime.now().difference(since) < _stallGrace) return;
+
+    _stallLogged = true;
+    final song = state.songs.elementAtOrNull(index);
+    debugPrint(
+      '[Playback] "${song?.name ?? track.itemId}" is stalled: '
+      '${targetState.position.inSeconds}s played, '
+      '${buffered.inSeconds}s buffered and not growing',
+    );
+  }
+
+  void _listenToTarget() {
+    _targetSubscription = _target.stateStream.listen(_onTargetState);
+    unawaited(_loadFailureSubscription?.cancel());
+    final target = _target;
+    _loadFailureSubscription = target is LoadFailureReporting
+        ? target.loadFailures.listen(_onTrackLoadFailure)
+        : null;
+  }
+
+  Future<void> _onTrackLoadFailure(TrackLoadFailure failure) async {
+    if (_target.kind != PlaybackTargetKind.local) return;
+    if (_ref.read(isOfflineProvider)) return;
+    if (_ref.read(manualOfflineProvider)) return;
+    final itemId = failure.itemId;
+    if (itemId == null || _localSongIds.contains(itemId)) return;
+
+    var index = failure.index;
+    if (_tracks.elementAtOrNull(index)?.itemId != itemId) {
+      index = _tracks.indexWhere((track) => track.itemId == itemId);
+    }
+    final track = _tracks.elementAtOrNull(index);
+    if (track == null || track.isLocalFile || !track.isHls) return;
+
+    final song = state.songs.where((song) => song.id == itemId).firstOrNull;
+    final album = state.album;
+    final sessionId = _playSessionIds[itemId];
+    if (song == null || album == null || sessionId == null) return;
+    if (!_streamFallbackIds.add(itemId)) return;
+
+    debugPrint(
+      '[Playback] "${song.name}" failed to load over HLS; '
+      'falling back to a progressive stream',
+    );
+    try {
+      final resolved = await _resolveTrack(
+        song,
+        album,
+        sessionId,
+        keepStreamOffline: true,
+      );
+      final replacement = resolved?.track;
+      final target = _target;
+      if (replacement == null ||
+          replacement.isHls ||
+          target is! SwappableQueue) {
+        _streamFallbackIds.remove(itemId);
+        return;
+      }
+      if (_tracks.elementAtOrNull(index)?.itemId != itemId) {
+        index = _tracks.indexWhere((track) => track.itemId == itemId);
+      }
+      if (index < 0 || index >= _tracks.length) return;
+      await _editQueue(() => target.replace(index, replacement));
+      _tracks[index] = replacement;
+      state = state.copyWith(deliveredQualities: _deliveredQualities());
+    } on Object catch (error) {
+      _streamFallbackIds.remove(itemId);
+      debugPrint('[Playback] the progressive fallback failed: $error');
+    }
+  }
+
+  void _onTargetState(TargetPlaybackState targetState) {
+    _targetState = targetState;
+    // TODO: Come up with some better idea, this is shit and smells like shit
+    // This is hack which I have no idea how to do right currently. Basically it fixes issue when currenply playing song would point to wrong object right after reorder.
+    final index = _queueEditsInFlight > 0
+        ? state.currentMediaIndex
+        : targetState.currentIndex;
+
+    if (targetState.status == PlaybackStatus.error) {
+      _onTargetFailure();
+      return;
+    }
+
+    if (_preparingQueue) return;
+
+    if (index != _reportedIndex) {
+      _reportTrackChange(index);
+      final nextSong = index != null
+          ? state.songs.elementAtOrNull(index)
+          : null;
+      if (nextSong != null && state.album != null) {
+        unawaited(_saveToStorage(songId: nextSong.id, positionMs: 0));
+      }
+    }
+
+    if (index == _reportedIndex && targetState.position > Duration.zero) {
+      _reportedPositionMs = targetState.position.inMilliseconds;
+    }
+
+    state = state.copyWith(
+      position: targetState.position,
+      cacheProgress: targetState.bufferedPosition ?? Duration.zero,
+      totalDuration: _durationFor(index),
+      currentMediaIndex: index,
+    );
+
+    final now = DateTime.now();
+    if (state.status.isPlaying &&
+        (_lastPositionSave == null ||
+            now.difference(_lastPositionSave!).inSeconds >= 5)) {
+      _lastPositionSave = now;
+      final currentSong = index != null
+          ? state.songs.elementAtOrNull(index)
+          : null;
+      if (currentSong != null) {
+        unawaited(
+          _saveToStorage(
+            songId: currentSong.id,
+            positionMs: targetState.position.inMilliseconds,
+            periodic: true,
+          ),
+        );
+      }
+    }
+
+    _checkForStall(targetState);
+
+    if (targetState.completed && state.status.isPlaying) {
+      _reportStopped();
+      _stopProgressReports();
+      _reportedIndex = 0;
+      _reportedPositionMs = 0;
+      state = state.copyWith(
+        status: PlaybackStatus.stopped,
+        position: Duration.zero,
+        currentMediaIndex: 0,
+        totalDuration: _durationFor(0),
+      );
+      final first = state.songs.elementAtOrNull(0);
+      if (first != null && state.album != null) {
+        unawaited(
+          _saveToStorage(songId: first.id, positionMs: 0, resume: false),
+        );
+      }
+      unawaited(_clearResumePoint(state.sourceId));
+      if (_target.kind == PlaybackTargetKind.local) {
+        unawaited(_rewindToQueueStart());
+      }
+    } else if (targetState.status.isPlaying && !state.status.isPlaying) {
+      state = state.copyWith(status: PlaybackStatus.playing);
+      _cancelPausedIdleTimer();
+      _reportProgress();
+      _startProgressReports();
+    } else if (targetState.status.isPaused && state.status.isPlaying) {
+      state = state.copyWith(
+        status: PlaybackStatus.paused,
+        position: targetState.position,
+      );
+      _stopProgressReports();
+      _reportProgress();
+      _startPausedIdleTimer();
+    }
+  }
+
+  void _startPausedIdleTimer() {
+    _pausedIdleTimer?.cancel();
+    _pausedIdleTimer = Timer(pausedIdleTimeout, _reportSuspended);
+  }
+
+  void _cancelPausedIdleTimer() {
+    _pausedIdleTimer?.cancel();
+    _pausedIdleTimer = null;
+  }
+
+  void _reportSuspended() {
+    _pausedIdleTimer = null;
+    if (!_startReported) return;
+    final song = _reportedSong;
+    if (song == null) return;
+    _report(
+      (client) => client.reportPlaybackSuspended(
+        _playbackReport(
+          song,
+          positionMs: _targetState.position.inMilliseconds,
+          isPaused: true,
+        ),
+      ),
+    );
+  }
+
+  Future<void> reportExit() async {
+    _stopProgressReports();
+    _lastReport = null;
+    _reportStopped();
+    await _lastReport;
+  }
+
+  Future<void> switchTarget(PlaybackTarget to, {bool carryQueue = true}) {
+    if (to.id != _destination.id) {
+      _queueSwitch(to, carryQueue: carryQueue);
+      _ref.read(playbackTargetProvider.notifier).select(to);
+    }
+    return _switching;
+  }
+
+  Future<void> reloadOnTarget() async {
+    final songs = state.songs;
+    final album = state.album;
+    if (songs.isEmpty || album == null) return;
+    final index = state.currentMediaIndex ?? 0;
+    await play(
+      songs.elementAtOrNull(index) ?? songs.first,
+      songs,
+      album,
+      initialPosition: state.position,
+      autoPlay: false,
+      reshuffle: false,
+    );
+  }
+
+  void _queueSwitch(PlaybackTarget to, {required bool carryQueue}) {
+    _destination = to;
+    final previous = _switching;
+    _switching = () async {
+      await previous;
+      await _handoff(from: _target, to: to, carryQueue: carryQueue);
+    }();
+  }
+
+  Future<void> _handoff({
+    required PlaybackTarget from,
+    required PlaybackTarget to,
+    required bool carryQueue,
+  }) async {
+    if (from.id == to.id) return;
+    final songs = state.songs;
+    final album = state.album;
+    final wasPlaying = state.status.isPlaying && !_fallingBack;
+    final index = state.currentMediaIndex ?? 0;
+    final position = state.position;
+
+    await _targetSubscription?.cancel();
+    _targetSubscription = null;
+
+    _reportStopped();
+    _stopProgressReports();
+    try {
+      await from.stop();
+    } on Object catch (error) {
+      debugPrint('[Playback] stopping ${from.name} failed: $error');
+    }
+    if (from.kind != PlaybackTargetKind.local) await from.dispose();
+
+    _target = to;
+    _targetState = TargetPlaybackState.idle;
+    _fallingBack = false;
+    _listenToTarget();
+    unawaited(_recordCastSession(to));
+    if (to.kind != PlaybackTargetKind.local) await _applySavedVolume(to);
+
+    if (!carryQueue) {
+      state = state.copyWith(status: PlaybackStatus.paused);
+      return;
+    }
+    if (songs.isEmpty || album == null) return;
+
+    final startSong = songs.elementAtOrNull(index) ?? songs.first;
+    await play(
+      startSong,
+      songs,
+      album,
+      initialPosition: position,
+      autoPlay: wasPlaying,
+      reshuffle: false,
+    );
+  }
+
+  Future<void> _recordCastSession(PlaybackTarget target) async {
+    final serverId = _ref.read(currentServerIdProvider);
+    if (serverId == null || serverId.isEmpty) return;
+    final storage = CastSessionStorage();
+    if (target is UpnpPlaybackTarget) {
+      final renderer = target.renderer;
+      await storage.save(
+        serverId: serverId,
+        session: CastSession(
+          udn: renderer.id,
+          location: renderer.device.location,
+          name: renderer.name,
+        ),
+      );
+    } else {
+      await storage.clear(serverId);
+    }
+  }
+
+  Future<void> _applySavedVolume(PlaybackTarget target) async {
+    final settings = _ref.read(appSettingsProvider.notifier);
+    try {
+      await target.setVolume(savedRendererLevel(settings, target.id));
+    } on Object catch (error) {
+      debugPrint('[Playback] setting ${target.name} volume failed: $error');
+    }
+  }
+
+  Future<void> _editQueue(Future<void> Function() edit) async {
+    _queueEditsInFlight++;
+    final clock = Stopwatch()..start();
+    try {
+      await edit().timeout(queueEditTimeout);
+      if (clock.elapsed > const Duration(seconds: 2)) {
+        debugPrint(
+          '[Playback] queue edit on ${_target.name} took '
+          '${clock.elapsed.inSeconds}s',
+        );
+      }
+    } on TimeoutException {
+      debugPrint(
+        '[Playback] queue edit on ${_target.name} gave no answer in '
+        '${queueEditTimeout.inSeconds}s; following the player again',
+      );
+    } finally {
+      _queueEditsInFlight--;
+      if (_queueEditsInFlight == 0) {
+        _queueEditsSettled?.complete();
+        _queueEditsSettled = null;
+      }
+    }
+  }
+
+  Future<void> _queueEditsToSettle() {
+    if (_queueEditsInFlight == 0) return Future<void>.value();
+    return (_queueEditsSettled ??= Completer<void>()).future;
+  }
+
+  Duration? _durationFor(int? index, {List<LibraryItem>? songs}) {
+    final song = index != null
+        ? (songs ?? state.songs).elementAtOrNull(index)
+        : null;
+    if (song != null && song.duration > Duration.zero) {
+      return song.duration;
+    }
+    return _targetState.duration;
+  }
+
+  PlaybackReport _playbackReport(
+    LibraryItem song, {
+    required int positionMs,
+    bool? isPaused,
+  }) => PlaybackReport(
+    itemId: song.id,
+    playSessionId: _playSessionIds[song.id] ?? '',
+    mediaSourceId: song.audioSources.firstOrNull?.id ?? song.id,
+    position: Duration(milliseconds: positionMs),
+    duration: song.duration,
+    isPaused: isPaused,
+    canSeek: _targetState.canSeek,
+    queueItemIds: _reportedQueueWindow(song),
+  );
+
+  @visibleForTesting
+  static int reportedQueueReach = 50;
+
+  List<String> _reportedQueueWindow(LibraryItem song) {
+    final songs = state.songs;
+    var index = _reportedIndex;
+    if (index == null || songs.elementAtOrNull(index)?.id != song.id) {
+      index = songs.indexWhere((queued) => queued.id == song.id);
+    }
+    if (index < 0) return const [];
+    final start = (index - reportedQueueReach).clamp(0, songs.length);
+    final end = (index + reportedQueueReach + 1).clamp(0, songs.length);
+    return [for (final queued in songs.getRange(start, end)) queued.id];
+  }
+
+  void _reportStarted(
+    LibraryItem song, {
+    required int positionMs,
+    bool? isPaused,
+  }) {
+    if (song.isRadioStream) return;
+    _startReported = true;
+    _report(
+      (client) => client.reportPlaybackStarted(
+        _playbackReport(song, positionMs: positionMs, isPaused: isPaused),
+      ),
+    );
+  }
+
+  void _reportStopped() {
+    _cancelPausedIdleTimer();
+    if (!_startReported) return;
+    final song = _reportedSong;
+    if (song == null) return;
+    _startReported = false;
+    if (_listenedThrough(song)) {
+      _ref.read(reviewPromptProvider.notifier).recordTrackCompleted();
+    }
+    _report(
+      (client) => client.reportPlaybackStopped(
+        _playbackReport(song, positionMs: _reportedPositionMs),
+      ),
+    );
+  }
+
+  bool _listenedThrough(LibraryItem song) {
+    final total = song.duration.inMilliseconds;
+    return total > 0 && _reportedPositionMs >= total * 0.9;
+  }
+
+  void _reportProgress() {
+    if (!_startReported) return;
+    final song = _reportedSong;
+    if (song == null) return;
+    _report(
+      (client) => client.reportPlaybackProgress(
+        _playbackReport(
+          song,
+          positionMs: _targetState.position.inMilliseconds,
+          isPaused: !state.status.isPlaying,
+        ),
+      ),
+    );
+  }
+
+  void _reportTrackChange(int? index) {
+    _reportStopped();
+    _reportedIndex = index;
+    _reportedPositionMs = 0;
+    final song = _reportedSong;
+    if (song != null) {
+      _reportStarted(song, positionMs: 0, isPaused: false);
+      _startProgressReports();
+    } else {
+      _stopProgressReports();
+    }
+  }
+
+  void _startProgressReports() {
+    _progressTimer ??= Timer.periodic(
+      progressInterval,
+      (_) => _reportProgress(),
+    );
+  }
+
+  void _stopProgressReports() {
+    _progressTimer?.cancel();
+    _progressTimer = null;
+  }
+
+  void _report(Future<void> Function(MediaServerClient client) call) {
+    if (_ref.read(isOfflineProvider)) return;
+    final report = _runReport(call);
+    _lastReport = report;
+    unawaited(report);
+  }
+
+  Future<void> _runReport(
+    Future<void> Function(MediaServerClient client) call,
+  ) async {
+    try {
+      await call(_ref.read(mediaServerClientProvider));
+    } on DioException catch (error) {
+      debugPrint(
+        '[Playback] report ${error.requestOptions.path} failed: '
+        '${error.response?.statusCode} ${error.response?.data}',
+      );
+    } on Object catch (error) {
+      debugPrint('[Playback] report failed: $error');
+    }
+  }
+
+  Future<void> play(
+    LibraryItem playSong,
+    List<LibraryItem> songs,
+    LibraryItem album, {
+    String? sourceId,
+    Duration? initialPosition,
+    bool autoPlay = true,
+    bool reshuffle = true,
+    bool keepStreamsOffline = false,
+    bool resuming = false,
+  }) async {
+    final elsewhere = remote;
+    if (elsewhere != null &&
+        _localPlays == 0 &&
+        autoPlay &&
+        (initialPosition == null || resuming)) {
+      final request = PlayRequest(
+        song: playSong,
+        songs: songs,
+        album: album,
+        sourceId: sourceId,
+        position: initialPosition ?? Duration.zero,
+      );
+      if (await elsewhere.play(request)) return;
+    }
+    _queueLibraryId = _currentLibraryId;
+    final generation = ++_queueGeneration;
+    try {
+      final resolved = await _resolveQueue(
+        songs,
+        album,
+        on: _target,
+        keepStreamsOffline: keepStreamsOffline,
+      );
+      if (generation != _queueGeneration) return;
+
+      final sessionIds = resolved.sessionIds;
+      final playableSongs = resolved.songs;
+      final tracks = resolved.tracks;
+      final localIds = resolved.localIds;
+
+      if (tracks.isEmpty) {
+        debugPrint(
+          '[Playback] nothing in this queue can be played on '
+          '${_target.name}',
+        );
+        state = state.copyWith(status: PlaybackStatus.error);
+        return;
+      }
+
+      _reportStopped();
+      _playSessionIds
+        ..clear()
+        ..addAll(sessionIds);
+      _localSongIds
+        ..clear()
+        ..addAll(localIds);
+      _preparingQueue = true;
+      _reportedIndex = null;
+
+      if (reshuffle) {
+        if (state.shuffleEnabled) {
+          final source = [...playableSongs];
+          final sourceTracks = [...tracks];
+          final start = source.indexWhere((song) => song.id == playSong.id);
+          final order = _shuffledOrder(start < 0 ? 0 : start, source.length);
+          _unshuffledOrder = [for (final song in source) song.id];
+          playableSongs
+            ..clear()
+            ..addAll([for (final index in order) source[index]]);
+          tracks
+            ..clear()
+            ..addAll([for (final index in order) sourceTracks[index]]);
+        } else {
+          _unshuffledOrder = null;
+        }
+      }
+
+      final startIndex = playableSongs.indexWhere((s) => s.id == playSong.id);
+      final effectiveIndex = startIndex >= 0 ? startIndex : 0;
+      final startPosition = initialPosition ?? Duration.zero;
+
+      _tracks
+        ..clear()
+        ..addAll(tracks);
+
+      state = state.copyWith(
+        songs: playableSongs,
+        deliveredQualities: _deliveredQualities(),
+        album: album,
+        sourceId: sourceId,
+        status: PlaybackStatus.buffering,
+        position: startPosition,
+        cacheProgress: Duration.zero,
+        totalDuration: _durationFor(effectiveIndex, songs: playableSongs),
+        currentMediaIndex: effectiveIndex,
+      );
+
+      await _target.load(
+        tracks,
+        initialIndex: effectiveIndex,
+        initialPosition: startPosition,
+        autoPlay: autoPlay,
+      );
+      if (generation != _queueGeneration) return;
+
+      state = state.copyWith(
+        songs: playableSongs,
+        album: album,
+        status: autoPlay ? PlaybackStatus.playing : PlaybackStatus.paused,
+        position: startPosition,
+        totalDuration: _durationFor(effectiveIndex, songs: playableSongs),
+        currentMediaIndex: effectiveIndex,
+      );
+
+      _preparingQueue = false;
+      _reportedIndex = effectiveIndex;
+      _reportedPositionMs = startPosition.inMilliseconds;
+      if (autoPlay) {
+        _reportStarted(
+          playableSongs[effectiveIndex],
+          positionMs: startPosition.inMilliseconds,
+          isPaused: false,
+        );
+        _startProgressReports();
+      }
+
+      unawaited(
+        _saveToStorage(
+          songId: playableSongs[effectiveIndex].id,
+          positionMs: startPosition.inMilliseconds,
+          songs: playableSongs,
+          album: album,
+          resume: autoPlay,
+        ),
+      );
+    } catch (e, st) {
+      _preparingQueue = false;
+      debugPrint('Error in play(): type=${e.runtimeType}, message=$e\n$st');
+      if (e.toString().indexOf('setPitch') > 0) {
+        // This is hack to avoid playback state being error on ios*`
+
+        state = state.copyWith(
+          status: PlaybackStatus.playing,
+          position: Duration.zero,
+          totalDuration: _durationFor(_targetState.currentIndex),
+        );
+      } else {
+        state = state.copyWith(status: PlaybackStatus.error);
+      }
+    }
+  }
+
+  Future<
+    ({
+      List<LibraryItem> songs,
+      List<TargetTrack> tracks,
+      Map<String, String> sessionIds,
+      Set<String> localIds,
+    })
+  >
+  _resolveQueue(
+    List<LibraryItem> songs,
+    LibraryItem album, {
+    required PlaybackTarget on,
+    bool keepStreamsOffline = false,
+  }) async {
+    final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(16);
+    final sessionIds = {
+      for (final song in songs) song.id: '$deviceId-$stamp-${song.id}',
+    };
+
+    final cachedPaths = await _cachedPaths(songs, on: on);
+    final downloadedPaths = await _downloadedPaths(songs, on: on);
+    final resolved = await Future.wait(
+      songs.map(
+        (song) => _resolveTrack(
+          song,
+          album,
+          sessionIds[song.id]!,
+          cachedPath: cachedPaths[song.id],
+          downloadedPaths: downloadedPaths,
+          keepStreamOffline: keepStreamsOffline,
+          on: on,
+        ),
+      ),
+    );
+
+    final playableSongs = <LibraryItem>[];
+    final tracks = <TargetTrack>[];
+    final localIds = <String>{};
+    for (final entry in resolved) {
+      if (entry == null) continue;
+      playableSongs.add(entry.song);
+      tracks.add(entry.track);
+      if (entry.track.isLocalFile) localIds.add(entry.song.id);
+    }
+    return (
+      songs: playableSongs,
+      tracks: tracks,
+      sessionIds: sessionIds,
+      localIds: localIds,
+    );
+  }
+
+  Future<Map<String, String>> _cachedPaths(
+    List<LibraryItem> songs, {
+    PlaybackTarget? on,
+  }) async {
+    if (!(on ?? _target).supportsLocalFiles || songs.isEmpty) {
+      return const <String, String>{};
+    }
+    try {
+      return await _ref.read(queueCacheDatabaseProvider).pathsFor([
+        for (final song in songs) song.id,
+      ]);
+    } on Object catch (error) {
+      debugPrint('[Playback] reading cached paths failed: $error');
+      return const <String, String>{};
+    }
+  }
+
+  Future<Map<String, String>> _downloadedPaths(
+    List<LibraryItem> songs, {
+    PlaybackTarget? on,
+  }) async {
+    if (!(on ?? _target).supportsLocalFiles || songs.isEmpty) {
+      return const <String, String>{};
+    }
+    try {
+      return await _ref.read(downloadDatabaseProvider).downloadedPathsFor([
+        for (final song in songs) song.id,
+      ]);
+    } on Object catch (error) {
+      debugPrint('[Playback] reading downloaded paths failed: $error');
+      return const <String, String>{};
+    }
+  }
+
+  Map<String, AudioSourceInfo> _deliveredQualities() => {
+    for (final track in _tracks)
+      track.itemId: ?QualityExtras.streamed(track.extras),
+  };
+
+  Future<AudioSourceInfo?> _cachedQuality(String id) async {
+    try {
+      return await _ref.read(queueCacheDatabaseProvider).qualityOf(id);
+    } on Object catch (error) {
+      debugPrint('[Playback] reading cached quality failed: $error');
+      return null;
+    }
+  }
+
+  Future<({LibraryItem song, TargetTrack track})?> _resolveTrack(
+    LibraryItem song,
+    LibraryItem album,
+    String playSessionId, {
+    String? cachedPath,
+    Map<String, String>? downloadedPaths,
+    bool keepStreamOffline = false,
+    PlaybackTarget? on,
+  }) async {
+    final target = on ?? _target;
+    final String? downloadedPath;
+    if (!target.supportsLocalFiles) {
+      downloadedPath = null;
+    } else if (downloadedPaths != null) {
+      downloadedPath = downloadedPaths[song.id];
+    } else {
+      downloadedPath = await _ref
+          .read(downloadDatabaseProvider)
+          .getDownloadedSongPath(song.id);
+    }
+    final localPath =
+        downloadedPath ?? (target.supportsLocalFiles ? cachedPath : null);
+
+    if (localPath == null && _ref.read(manualOfflineProvider)) return null;
+    if (localPath == null &&
+        !keepStreamOffline &&
+        _ref.read(isOfflineProvider)) {
+      return null;
+    }
+
+    final audioSource = song.audioSources.firstOrNull;
+
+    Uri uri;
+    Uri? location;
+    var isHls = false;
+    var transcoded = false;
+    var mimeType = 'application/octet-stream';
+    var quality = audioSource;
+    if (localPath != null) {
+      uri = Uri.file(localPath);
+      if (downloadedPath == null) {
+        quality = await _cachedQuality(song.id) ?? audioSource;
+      }
+    } else {
+      if (target.kind == PlaybackTargetKind.local) {
+        await _ref.read(networkTypeProvider.notifier).ready;
+      }
+      var streamProfile = _streamProfileFor(target);
+      if (_streamFallbackIds.contains(song.id)) {
+        streamProfile = streamProfile.withoutHls();
+      }
+      final resolved = await _ref
+          .read(mediaServerClientProvider)
+          .resolveStreamSource(
+            song,
+            playSessionId: playSessionId,
+            target: streamProfile,
+          );
+      uri = resolved.uri;
+      location = resolved.location;
+      isHls = resolved.isHls;
+      mimeType = resolved.mimeType;
+      transcoded = resolved.requiresTranscode;
+      quality = resolved.delivered ?? audioSource;
+    }
+
+    var artUri = _artUri(song, album);
+    if (target.kind == PlaybackTargetKind.local) {
+      final proxy = _ref.read(streamProxyProvider);
+      uri = location == null
+          ? await proxy.resolve(uri)
+          : await proxy.forLocation(location);
+      if (artUri != null) artUri = await proxy.resolve(artUri);
+      if (Platform.isAndroid) artUri = androidCoverArtUri(artUri);
+    }
+
+    final extras = <String, dynamic>{
+      ...QualityExtras.of(original: audioSource, streamed: quality),
+      if (song.albumArtists.isNotEmpty)
+        'artistId': song.albumArtists.first.id
+      else if (album.albumArtists.isNotEmpty)
+        'artistId': album.albumArtists.first.id,
+    };
+
+    return (
+      song: song,
+      track: TargetTrack(
+        itemId: song.id,
+        uri: uri,
+        location: location,
+        mimeType: mimeType,
+        isHls: isHls,
+        title: song.name,
+        duration: song.duration,
+        artist: song.albumArtist ?? album.albumArtist,
+        album: song.albumName,
+        artUri: artUri,
+        transcoded: transcoded,
+        extras: extras,
+      ),
+    );
+  }
+
+  Uri? _artUri(LibraryItem song, LibraryItem album) =>
+      _ref.read(imageServiceProvider).songArtUri(song, album: album);
+
+  Future<void> seek(Duration position) async {
+    await _target.seek(position);
+    state = state.copyWith(position: position);
+    _reportedPositionMs = position.inMilliseconds;
+    _reportProgress();
+    final currentIndex = _targetState.currentIndex;
+    final currentSong = currentIndex != null
+        ? state.songs.elementAtOrNull(currentIndex)
+        : null;
+    if (currentSong != null) {
+      unawaited(
+        _saveToStorage(
+          songId: currentSong.id,
+          positionMs: position.inMilliseconds,
+        ),
+      );
+    }
+  }
+
+  Future<void> playPause() => switch (state.status.isPlaying) {
+    true => pause(),
+    false => resume(),
+  };
+
+  Future<void> pause() async {
+    await _target.pause();
+    state = state.copyWith(
+      status: PlaybackStatus.paused,
+      position: _targetState.position,
+    );
+    _stopProgressReports();
+    _reportProgress();
+  }
+
+  Future<void> resume() async {
+    final album = state.album;
+    if (state.status.isStopped && state.songs.isNotEmpty && album != null) {
+      // Case when queue has finished but user clicks on play(resume) button. In this case we want to restart playback from first song.
+      await play(
+        state.songs.first,
+        state.songs,
+        album,
+        sourceId: state.sourceId,
+      );
+      return;
+    }
+
+    unawaited(_target.play());
+    state = state.copyWith(
+      status: PlaybackStatus.playing,
+      position: _targetState.position,
+    );
+
+    final song = _reportedSong;
+    if (song != null && !_startReported) {
+      _reportStarted(
+        song,
+        positionMs: _targetState.position.inMilliseconds,
+        isPaused: false,
+      );
+    } else {
+      _reportProgress();
+    }
+    _startProgressReports();
+  }
+
+  Future<void> next() async {
+    await _target.seekToNext();
+    if (!_targetState.status.isPlaying) await _target.play();
+  }
+
+  Future<void> prev() => _target.seekToPrevious();
+
+  Future<void> skipTo(int index, {bool autoPlay = false}) async {
+    await _target.skipTo(index);
+    if (autoPlay && !_targetState.status.isPlaying) await _target.play();
+  }
+
+  void adoptShuffle({required bool enabled}) {
+    if (enabled == state.shuffleEnabled) return;
+    _unshuffledOrder = null;
+    state = state.copyWith(shuffleEnabled: enabled);
+  }
+
+  Future<void> setShuffle({required bool enabled}) async {
+    if (enabled == state.shuffleEnabled) return;
+
+    final songs = state.songs;
+    if (songs.isEmpty) {
+      state = state.copyWith(shuffleEnabled: enabled);
+      return;
+    }
+    if (_tracks.length != songs.length) {
+      debugPrint('[Playback] queue is out of sync; leaving its order alone');
+      state = state.copyWith(shuffleEnabled: enabled);
+      return;
+    }
+
+    final current = (state.currentMediaIndex ?? 0).clamp(0, songs.length - 1);
+    final order = enabled
+        ? _shuffledOrder(current, songs.length)
+        : _unshuffledIndices(songs);
+    _unshuffledOrder = enabled ? [for (final song in songs) song.id] : null;
+
+    state = state.copyWith(shuffleEnabled: enabled);
+    await _applyOrder(order);
+
+    final playing = state.currentMediaIndex;
+    final song = playing != null ? state.songs.elementAtOrNull(playing) : null;
+    if (song != null) {
+      unawaited(
+        _saveToStorage(
+          songId: song.id,
+          positionMs: state.position.inMilliseconds,
+        ),
+      );
+    }
+  }
+
+  List<int> _shuffledOrder(int current, int length) {
+    final rest = [
+      for (var index = 0; index < length; index++)
+        if (index != current) index,
+    ]..shuffle();
+    return [current, ...rest];
+  }
+
+  List<int> _unshuffledIndices(List<LibraryItem> songs) {
+    final original = _unshuffledOrder;
+    if (original == null) {
+      return [for (var index = 0; index < songs.length; index++) index];
+    }
+
+    final positions = <String, List<int>>{};
+    for (final (position, id) in original.indexed) {
+      (positions[id] ??= <int>[]).add(position);
+    }
+
+    final ranked = <({int rank, int index})>[];
+    for (final (index, song) in songs.indexed) {
+      final queued = positions[song.id];
+      final rank = queued == null || queued.isEmpty
+          ? original.length + index
+          : queued.removeAt(0);
+      ranked.add((rank: rank, index: index));
+    }
+    ranked.sort((a, b) => a.rank.compareTo(b.rank));
+    return [for (final entry in ranked) entry.index];
+  }
+
+  Future<void> _applyOrder(List<int> order) async {
+    final songs = state.songs;
+    final tracks = [for (final index in order) _tracks[index]];
+    final current = state.currentMediaIndex;
+    final currentIndex = current != null ? order.indexOf(current) : null;
+
+    final reported = _reportedIndex;
+    if (reported != null) {
+      final moved = order.indexOf(reported);
+      _reportedIndex = moved < 0 ? null : moved;
+    }
+
+    _tracks
+      ..clear()
+      ..addAll(tracks);
+    state = state.copyWith(
+      songs: [for (final index in order) songs[index]],
+      currentMediaIndex: currentIndex,
+    );
+
+    await _editQueue(
+      () => _target.reorder(
+        tracks,
+        order: order,
+        currentIndex: currentIndex ?? 0,
+      ),
+    );
+  }
+
+  Future<void> _rewindToQueueStart() async {
+    await _target.pause();
+    await _target.skipTo(0);
+  }
+
+  void updateSong(LibraryItem song) {
+    final index = state.songs.indexWhere((item) => item.id == song.id);
+    if (index < 0) return;
+    state = state.copyWith(songs: [...state.songs]..[index] = song);
+  }
+
+  Future<void> moveInQueue(int from, int to) async {
+    if (from == to) return;
+    if (await remote?.move(from, to) ?? false) return;
+    final songs = [...state.songs];
+    if (from < 0 || from >= songs.length) return;
+    if (to < 0 || to >= songs.length) return;
+
+    songs.insert(to, songs.removeAt(from));
+    _tracks.insert(to, _tracks.removeAt(from));
+    final current = state.currentMediaIndex;
+    final reported = _reportedIndex;
+    if (reported != null) _reportedIndex = _movedIndex(reported, from, to);
+    state = state.copyWith(
+      songs: songs,
+      currentMediaIndex: current != null
+          ? _movedIndex(current, from, to)
+          : null,
+    );
+
+    await _editQueue(() => _target.move(from, to));
+  }
+
+  Future<bool> playNext(LibraryItem song) =>
+      _enqueueAll([song], playNext: true);
+
+  Future<bool> addToQueue(LibraryItem song) =>
+      _enqueueAll([song], playNext: false);
+
+  Future<bool> playNextAll(List<LibraryItem> songs, {LibraryItem? set}) =>
+      _enqueueAll(songs, playNext: true, set: set);
+
+  Future<bool> addAllToQueue(
+    List<LibraryItem> songs, {
+    LibraryItem? set,
+    bool Function()? accept,
+  }) => _enqueueAll(songs, playNext: false, set: set, accept: accept);
+
+  Future<bool> replaceUpcoming(
+    List<LibraryItem> songs,
+    LibraryItem album, {
+    String? sourceId,
+  }) async {
+    final elsewhere = remote;
+    if (elsewhere != null &&
+        await elsewhere.replaceUpcoming(songs, album, sourceId: sourceId)) {
+      return true;
+    }
+    final startIndex = state.currentMediaIndex;
+    final playing = startIndex != null
+        ? state.songs.elementAtOrNull(startIndex)
+        : null;
+    if (playing == null) return false;
+    _queueLibraryId = _currentLibraryId;
+
+    final upcoming = [
+      for (final song in songs)
+        if (song.id != playing.id) song,
+    ];
+    final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(16);
+    final sessionIds = {
+      for (final song in upcoming) song.id: '$deviceId-$stamp-${song.id}',
+    };
+    final cachedPaths = await _cachedPaths(upcoming);
+    final resolved = await Future.wait(
+      upcoming.map(
+        (song) => _resolveTrack(
+          song,
+          album,
+          sessionIds[song.id]!,
+          cachedPath: cachedPaths[song.id],
+        ),
+      ),
+    );
+
+    final current = state.currentMediaIndex;
+    if (current == null ||
+        state.songs.elementAtOrNull(current)?.id != playing.id ||
+        current >= _tracks.length) {
+      return false;
+    }
+
+    final playableSongs = <LibraryItem>[];
+    final tracks = <TargetTrack>[];
+    final localIds = <String>{};
+    for (final entry in resolved) {
+      if (entry == null) continue;
+      playableSongs.add(entry.song);
+      tracks.add(entry.track);
+      if (entry.track.isLocalFile) localIds.add(entry.song.id);
+    }
+
+    if (state.shuffleEnabled) {
+      _unshuffledOrder = [
+        playing.id,
+        for (final song in playableSongs) song.id,
+      ];
+      final order = _shuffledOrder(0, playableSongs.length + 1).skip(1);
+      final source = [...playableSongs];
+      final sourceTracks = [...tracks];
+      playableSongs
+        ..clear()
+        ..addAll([for (final index in order) source[index - 1]]);
+      tracks
+        ..clear()
+        ..addAll([for (final index in order) sourceTracks[index - 1]]);
+    } else {
+      _unshuffledOrder = null;
+    }
+
+    final playingSessionId = _playSessionIds[playing.id];
+    _playSessionIds
+      ..clear()
+      ..addAll({
+        for (final song in playableSongs) song.id: sessionIds[song.id]!,
+      });
+    if (playingSessionId != null) {
+      _playSessionIds[playing.id] = playingSessionId;
+    }
+
+    final playingIsLocal = _localSongIds.contains(playing.id);
+    _localSongIds
+      ..clear()
+      ..addAll(localIds);
+    if (playingIsLocal) _localSongIds.add(playing.id);
+
+    _reportedIndex = _reportedIndex == current ? 0 : null;
+
+    final playingTrack = _tracks[current];
+    _tracks
+      ..clear()
+      ..add(playingTrack)
+      ..addAll(tracks);
+    state = state.copyWith(
+      songs: [playing, ...playableSongs],
+      deliveredQualities: _deliveredQualities(),
+      album: album,
+      sourceId: sourceId,
+      currentMediaIndex: 0,
+    );
+
+    await _editQueue(() => _target.replaceAroundCurrent(current, tracks));
+
+    unawaited(
+      _saveToStorage(
+        songId: playing.id,
+        positionMs: state.position.inMilliseconds,
+        songs: state.songs,
+        album: album,
+      ),
+    );
+    return true;
+  }
+
+  Future<bool> _enqueueAll(
+    List<LibraryItem> songs, {
+    required bool playNext,
+    LibraryItem? set,
+    bool Function()? accept,
+  }) async {
+    if (accept != null && !accept()) return false;
+    if (songs.isEmpty) return false;
+    if (await remote?.enqueue(songs, playNext: playNext) ?? false) return true;
+
+    if (state.songs.isEmpty) {
+      await play(
+        songs.first,
+        songs,
+        set ?? state.album ?? songs.first,
+        autoPlay: false,
+      );
+      return state.songs.isNotEmpty;
+    }
+
+    final generation = _queueGeneration;
+    final resolved = await _resolveQueue(
+      songs,
+      state.album ?? set ?? songs.first,
+      on: _target,
+    );
+    // Stream resolution may finish after the user replaced the queue. Never
+    // append stale radio/search results into that newer listening session.
+    if (generation != _queueGeneration ||
+        resolved.tracks.isEmpty ||
+        (accept != null && !accept()))
+      return false;
+    for (final song in resolved.songs) {
+      _playSessionIds[song.id] = resolved.sessionIds[song.id]!;
+      if (resolved.localIds.contains(song.id)) {
+        _localSongIds.add(song.id);
+      } else {
+        _localSongIds.remove(song.id);
+      }
+    }
+
+    final current = state.currentMediaIndex;
+    final index = playNext
+        ? ((current ?? -1) + 1).clamp(0, state.songs.length)
+        : state.songs.length;
+
+    _tracks.insertAll(index.clamp(0, _tracks.length), resolved.tracks);
+    state = state.copyWith(
+      songs: [...state.songs]..insertAll(index, resolved.songs),
+      deliveredQualities: _deliveredQualities(),
+      currentMediaIndex: current != null && index <= current
+          ? current + resolved.tracks.length
+          : current,
+    );
+
+    await _editQueue(
+      () => _target.insertAll(index, resolved.tracks, playNext: playNext),
+    );
+    return true;
+  }
+
+  Future<void> removeFromQueue(int index) async {
+    if (await remote?.remove(index) ?? false) return;
+    final songs = [...state.songs];
+    if (index < 0 || index >= songs.length) return;
+    if (songs.length == 1) return clearQueue();
+
+    final wasCurrent = state.currentMediaIndex == index;
+    songs.removeAt(index);
+    if (index < _tracks.length) _tracks.removeAt(index);
+
+    if (wasCurrent) {
+      _reportStopped();
+      _reportedIndex = null;
+      _reportedPositionMs = 0;
+    } else {
+      final reported = _reportedIndex;
+      if (reported != null) {
+        _reportedIndex = _removedIndex(reported, index, songs.length);
+      }
+    }
+
+    state = state.copyWith(
+      songs: songs,
+      currentMediaIndex: _removedIndex(
+        state.currentMediaIndex,
+        index,
+        songs.length,
+      ),
+    );
+
+    await _editQueue(() => _target.remove(index));
+  }
+
+  int? _removedIndex(int? index, int removed, int length) {
+    if (index == null) return null;
+    if (index < removed) return index;
+    if (index > removed) return index - 1;
+    return index.clamp(0, length - 1);
+  }
+
+  int _movedIndex(int index, int from, int to) {
+    if (index == from) return to;
+    if (from < to && index > from && index <= to) return index - 1;
+    if (from > to && index >= to && index < from) return index + 1;
+    return index;
+  }
+
+  Future<void> stop() async {
+    await _target.stop();
+    _stopProgressReports();
+    _reportStopped();
+    state = state.copyWith(
+      status: PlaybackStatus.stopped,
+      position: Duration.zero,
+      totalDuration: Duration.zero,
+    );
+  }
+
+  Future<void> clear() async {
+    await stop();
+    _localSongIds.clear();
+    _tracks.clear();
+    _unshuffledOrder = null;
+    state = PlaybackState.initial();
+  }
+
+  Future<void> clearQueue() async {
+    await clear();
+    final serverId = _ref.read(currentServerIdProvider);
+    if (serverId != null && serverId.isNotEmpty) {
+      await PlaybackStorage().clear(serverId);
+    }
+  }
+
+  Future<void> adoptCachedFiles(Map<String, String> pathsById) {
+    if (pathsById.isEmpty) return Future<void>.value();
+    return _swapQueue('adopted', (song, album, sessionId) async {
+      final path = pathsById[song.id];
+      if (path == null || _localSongIds.contains(song.id)) return null;
+      final resolved = await _resolveTrack(
+        song,
+        album,
+        sessionId,
+        cachedPath: path,
+      );
+      final track = resolved?.track;
+      return track != null && track.isLocalFile ? track : null;
+    });
+  }
+
+  Future<void> requalifyStreams() {
+    final generation = ++_requalifyGeneration;
+    Future<Map<String, String>>? downloaded;
+    return _swapQueue(
+      'requalified',
+      (song, album, sessionId) async {
+        if (_localSongIds.contains(song.id)) return null;
+        downloaded ??= _downloadedPaths(state.songs);
+        final resolved = await _resolveTrack(
+          song,
+          album,
+          sessionId,
+          downloadedPaths: await downloaded,
+          keepStreamOffline: true,
+        );
+        return resolved?.track;
+      },
+      cancelled: () => generation != _requalifyGeneration,
+      retryWhenInterrupted: true,
+    );
+  }
+
+  Future<void> _swapQueue(
+    String label,
+    _ResolveSwap resolve, {
+    bool Function()? cancelled,
+    bool retryWhenInterrupted = false,
+  }) {
+    final pending = _swaps.then(
+      (_) => _runSwap(
+        label,
+        resolve,
+        cancelled: cancelled,
+        retryWhenInterrupted: retryWhenInterrupted,
+      ),
+    );
+    _swaps = pending.then(
+      (_) {},
+      onError: (Object error) =>
+          debugPrint('[Playback] $label swap failed: $error'),
+    );
+    return pending;
+  }
+
+  Future<void> _runSwap(
+    String label,
+    _ResolveSwap resolve, {
+    required bool Function()? cancelled,
+    required bool retryWhenInterrupted,
+  }) async {
+    final target = _target;
+    if (target is! SwappableQueue) return;
+    final album = state.album;
+    if (album == null) return;
+
+    final songs = state.songs;
+    final keepCurrent = target.holdsCurrentTrack;
+    final start = (state.currentMediaIndex ?? -1) + (keepCurrent ? 1 : 0);
+    var swapped = 0;
+    var interrupted = false;
+    debugPrint(
+      '[Playback] $label: walking ${songs.length} songs from $start, '
+      'current ${keepCurrent ? 'kept' : 'included'}',
+    );
+
+    bool proceed(int index, LibraryItem song) {
+      if (cancelled?.call() ?? false) return false;
+      interrupted = !_slotHolds(index, song, queueLength: songs.length);
+      return !interrupted;
+    }
+
+    try {
+      for (var step = 0; step < songs.length; step++) {
+        final index = (start + step) % songs.length;
+        final song = songs[index];
+        await _queueEditsToSettle();
+        if (!proceed(index, song)) return;
+        if (keepCurrent && index == state.currentMediaIndex) continue;
+        final sessionId = _playSessionIds[song.id];
+        if (sessionId == null) continue;
+
+        final track = await resolve(song, album, sessionId);
+        if (track == null) continue;
+        await _queueEditsToSettle();
+        if (!proceed(index, song)) return;
+        if (keepCurrent && index == state.currentMediaIndex) continue;
+        if (index < _tracks.length && _sameStream(_tracks[index], track)) {
+          continue;
+        }
+
+        await _editQueue(() => target.replace(index, track));
+        if (index < _tracks.length) _tracks[index] = track;
+        if (track.isLocalFile) {
+          _localSongIds.add(song.id);
+        } else {
+          _localSongIds.remove(song.id);
+        }
+        swapped++;
+      }
+    } finally {
+      if (swapped > 0 && mounted) {
+        state = state.copyWith(deliveredQualities: _deliveredQualities());
+      }
+      debugPrint(
+        '[Playback] $label $swapped tracks'
+        '${interrupted ? ', interrupted by a queue change' : ''}'
+        '${cancelled?.call() ?? false ? ', superseded' : ''}',
+      );
+      if (interrupted && retryWhenInterrupted && mounted) _scheduleRequalify();
+    }
+  }
+
+  bool _sameStream(TargetTrack a, TargetTrack b) =>
+      a.uri == b.uri &&
+      a.isLocalFile == b.isLocalFile &&
+      a.mimeType == b.mimeType &&
+      a.isHls == b.isHls &&
+      a.transcoded == b.transcoded &&
+      QualityExtras.streamed(a.extras) == QualityExtras.streamed(b.extras);
+
+  bool _slotHolds(int index, LibraryItem song, {required int queueLength}) =>
+      !_preparingQueue &&
+      _queueEditsInFlight == 0 &&
+      state.songs.length == queueLength &&
+      state.songs.elementAtOrNull(index)?.id == song.id;
+
+  void toggleRepeat() {
+    state = state.copyWith();
+  }
+
+  Future<void> _saveToStorage({
+    required String songId,
+    required int positionMs,
+    List<LibraryItem>? songs,
+    LibraryItem? album,
+    bool resume = true,
+    bool periodic = false,
+  }) async {
+    final serverId = _ref.read(currentServerIdProvider);
+    final effectiveSongs = songs ?? state.songs;
+    final effectiveAlbum = album ?? state.album;
+    if (serverId == null ||
+        serverId.isEmpty ||
+        effectiveSongs.isEmpty ||
+        effectiveAlbum == null) {
+      return;
+    }
+    if (resume) {
+      unawaited(
+        _saveResumePoint(
+          songId: songId,
+          positionMs: positionMs,
+          songs: effectiveSongs,
+          set: effectiveAlbum,
+          periodic: periodic,
+        ),
+      );
+    }
+    if (songs == null &&
+        album == null &&
+        !_queueDirty &&
+        _queueSavedFor == serverId) {
+      await PlaybackStorage().savePosition(
+        serverId: serverId,
+        songId: songId,
+        positionMs: positionMs,
+      );
+      return;
+    }
+    _queueDirty = false;
+    _queueSavedFor = serverId;
+    await PlaybackStorage().save(
+      serverId: serverId,
+      songs: effectiveSongs,
+      album: effectiveAlbum,
+      songId: songId,
+      positionMs: positionMs,
+      sourceId: state.sourceId,
+      shuffle: state.shuffleEnabled,
+      unshuffledOrder: _unshuffledOrder,
+    );
+  }
+
+  Future<void> _saveResumePoint({
+    required String songId,
+    required int positionMs,
+    required List<LibraryItem> songs,
+    required LibraryItem set,
+    bool periodic = false,
+  }) async {
+    final sourceId = state.sourceId;
+    if (sourceId == null || sourceId != set.id || !canResume(set)) return;
+    final index = songs.indexWhere((song) => song.id == songId);
+    if (index < 0) return;
+    final now = DateTime.now();
+    final song = '$sourceId/$songId';
+    final lastSave = _lastResumePointSave;
+    if (periodic &&
+        song == _resumePointSong &&
+        lastSave != null &&
+        now.difference(lastSave) < _resumePointInterval) {
+      return;
+    }
+    final point = (
+      item: set,
+      songId: songId,
+      songName: songs[index].name,
+      songIndex: index,
+      songCount: songs.length,
+      position: Duration(milliseconds: positionMs),
+      updatedAt: now,
+    );
+    _queueLibraryId ??= _currentLibraryId;
+    try {
+      await _ref
+          .read(resumePointDatabaseProvider)
+          .save(point, libraryId: _queueLibraryId);
+    } on Object {
+      return;
+    }
+    _resumePointSong = song;
+    _lastResumePointSave = now;
+    final key = '$sourceId/$songId/${isResumable(point)}';
+    if (_resumePointKey == key) return;
+    _resumePointKey = key;
+    _ref.read(resumePointsChangedProvider.notifier).state++;
+  }
+
+  String? get _currentLibraryId =>
+      _ref.read(currentLibraryProvider).valueOrNull?.id;
+
+  Future<void> _clearResumePoint(String? sourceId) async {
+    if (sourceId == null) return;
+    try {
+      await _ref.read(resumePointDatabaseProvider).delete(sourceId);
+    } on Object {
+      return;
+    }
+    _resumePointKey = null;
+    _resumePointSong = null;
+    _ref.read(resumePointsChangedProvider.notifier).state++;
+  }
+
+  void _adoptSavedShuffle(PlaybackSnapshot snapshot) {
+    _unshuffledOrder = snapshot.shuffle ? snapshot.unshuffledOrder : null;
+    if (state.shuffleEnabled != snapshot.shuffle) {
+      state = state.copyWith(shuffleEnabled: snapshot.shuffle);
+    }
+  }
+
+  Future<bool> tryRestore() async {
+    final generation = _queueGeneration;
+    final serverId = _ref.read(currentServerIdProvider);
+    final snapshot = serverId == null || serverId.isEmpty
+        ? null
+        : await PlaybackStorage().load(serverId);
+    if (snapshot == null || generation != _queueGeneration) {
+      debugPrint(
+        '[Playback] restore: ${snapshot == null ? 'nothing saved' : 'a queue '
+                  'was started meanwhile'}',
+      );
+      _ref.read(pendingMediaPlayProvider)();
+      return false;
+    }
+
+    final song = snapshot.songs.firstWhere(
+      (s) => s.id == snapshot.songId,
+      orElse: () => snapshot.songs.first,
+    );
+    debugPrint(
+      '[Playback] restore: ${snapshot.songs.length} songs, "${song.name}" at '
+      '${snapshot.positionMs ~/ 1000}s, offline=${_ref.read(isOfflineProvider)}',
+    );
+    _adoptSavedShuffle(snapshot);
+
+    if (await _adoptCastSession(snapshot, generation)) {
+      final pendingPress = _ref.read(pendingMediaPlayProvider)();
+      if (pendingPress && !state.status.isPlaying) await resume();
+      return true;
+    }
+    if (generation != _queueGeneration) {
+      _ref.read(pendingMediaPlayProvider)();
+      return false;
+    }
+
+    await play(
+      song,
+      snapshot.songs,
+      snapshot.album,
+      sourceId: snapshot.sourceId,
+      initialPosition: Duration(milliseconds: snapshot.positionMs),
+      autoPlay: false,
+      reshuffle: false,
+      keepStreamsOffline: true,
+    );
+    final pendingPress = _ref.read(pendingMediaPlayProvider)();
+    if (_queueGeneration != generation + 1) return false;
+    final alreadyPlaying = _targetState.status.isPlaying;
+    debugPrint(
+      '[Playback] restore done: target ${_targetState.status.name}, '
+      'pendingPress=$pendingPress',
+    );
+    if (pendingPress || alreadyPlaying) {
+      await resume();
+    }
+    return true;
+  }
+
+  Future<bool> _adoptCastSession(
+    PlaybackSnapshot snapshot,
+    int generation,
+  ) async {
+    if (_target.kind != PlaybackTargetKind.local) return false;
+    if (_ref.read(isOfflineProvider)) return false;
+    final serverId = _ref.read(currentServerIdProvider);
+    if (serverId == null || serverId.isEmpty) return false;
+
+    final ResumableCastSession? session;
+    try {
+      session = await _ref.read(castSessionResumeProvider).find(serverId);
+    } on Object catch (error) {
+      debugPrint('[Playback] cast session lookup failed: $error');
+      return false;
+    }
+    if (session == null || generation != _queueGeneration) return false;
+
+    final target = UpnpPlaybackTarget(session.renderer);
+    try {
+      final resolved = await _resolveQueue(
+        snapshot.songs,
+        snapshot.album,
+        on: target,
+      );
+      if (generation != _queueGeneration) return false;
+
+      final index = _castTrackIndex(
+        resolved.songs,
+        resolved.tracks,
+        savedSongId: snapshot.songId,
+        playing: session.trackUri,
+      );
+      if (index == null) {
+        debugPrint(
+          '[Playback] ${session.renderer.name} is playing something '
+          'else; not re-attaching',
+        );
+        return false;
+      }
+
+      debugPrint(
+        '[Playback] re-attaching to ${session.renderer.name}: '
+        '"${resolved.songs[index].name}" at ${session.position.inSeconds}s, '
+        '${session.playing ? 'playing' : 'paused'}',
+      );
+
+      _queueGeneration++;
+      await _targetSubscription?.cancel();
+      _target = _destination = target;
+      _targetState = TargetPlaybackState.idle;
+      _fallingBack = false;
+      _listenToTarget();
+      _ref.read(playbackTargetProvider.notifier).select(target);
+      unawaited(_recordCastSession(target));
+
+      _playSessionIds
+        ..clear()
+        ..addAll(resolved.sessionIds);
+      _localSongIds
+        ..clear()
+        ..addAll(resolved.localIds);
+      _tracks
+        ..clear()
+        ..addAll(resolved.tracks);
+
+      state = state.copyWith(
+        songs: resolved.songs,
+        deliveredQualities: _deliveredQualities(),
+        album: snapshot.album,
+        sourceId: snapshot.sourceId,
+        status: session.playing
+            ? PlaybackStatus.playing
+            : PlaybackStatus.paused,
+        position: session.position,
+        cacheProgress: Duration.zero,
+        totalDuration: _durationFor(index, songs: resolved.songs),
+        currentMediaIndex: index,
+      );
+
+      _reportedIndex = index;
+      _reportedPositionMs = session.position.inMilliseconds;
+
+      await target.attach(
+        resolved.tracks,
+        index: index,
+        position: session.position,
+        playing: session.playing,
+      );
+
+      if (session.playing) {
+        _reportStarted(
+          resolved.songs[index],
+          positionMs: session.position.inMilliseconds,
+          isPaused: false,
+        );
+        _startProgressReports();
+      }
+      unawaited(
+        _saveToStorage(
+          songId: resolved.songs[index].id,
+          positionMs: session.position.inMilliseconds,
+          songs: resolved.songs,
+          album: snapshot.album,
+          resume: session.playing,
+        ),
+      );
+      return true;
+    } on Object catch (error) {
+      debugPrint('[Playback] cast re-attach failed: $error');
+      return false;
+    } finally {
+      if (_target != target) await target.dispose();
+    }
+  }
+
+  int? _castTrackIndex(
+    List<LibraryItem> songs,
+    List<TargetTrack> tracks, {
+    required String savedSongId,
+    required Uri playing,
+  }) {
+    bool matches(TargetTrack track) {
+      final uri = track.uri;
+      if (uri == playing) return true;
+      if (uri.path != playing.path || uri.host != playing.host) return false;
+      final ours = uri.queryParameters['id'];
+      final theirs = playing.queryParameters['id'];
+      return ours == null || theirs == null || ours == theirs;
+    }
+
+    final saved = songs.indexWhere((song) => song.id == savedSongId);
+    final from = saved < 0 ? 0 : saved;
+    for (var index = from; index < tracks.length; index++) {
+      if (matches(tracks[index])) return index;
+    }
+    for (var index = 0; index < from; index++) {
+      if (matches(tracks[index])) return index;
+    }
+    return null;
+  }
+
+  @override
+  void dispose() {
+    _requalifyDebounce?.cancel();
+    _stopProgressReports();
+    _reportStopped();
+    unawaited(_targetSubscription?.cancel());
+    unawaited(_loadFailureSubscription?.cancel());
+    super.dispose();
+  }
+}
+
+final playbackProvider = StateNotifierProvider<PlaybackNotifier, PlaybackState>(
+  PlaybackNotifier.new,
+);
+
+ProviderListenable<PlaybackStatus?> queueSourceStatus(String id) =>
+    playbackProvider.select(
+      (state) => state.sourceId == id ? state.status : null,
+    );
+
+Future<void>? toggleQueueSource(WidgetRef ref, String id) {
+  final playback = ref.read(playbackProvider.notifier);
+  return switch (ref.read(queueSourceStatus(id))) {
+    PlaybackStatus.playing || PlaybackStatus.buffering => playback.pause(),
+    PlaybackStatus.paused => playback.resume(),
+    _ => null,
+  };
+}
+
+final currentSongProvider = Provider<LibraryItem?>(
+  (ref) => ref.watch(
+    playbackProvider.select((state) {
+      final index = state.currentMediaIndex;
+      return index != null ? state.songs.elementAtOrNull(index) : null;
+    }),
+  ),
+);
+
+typedef _ResolveSwap =
+    Future<TargetTrack?> Function(
+      LibraryItem song,
+      LibraryItem album,
+      String sessionId,
+    );

@@ -1,0 +1,189 @@
+import 'dart:convert';
+
+import 'package:jplayer/src/data/storages/download_database.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:sqflite/sqflite.dart';
+
+typedef SongPlay = ({LibraryItem song, DateTime playedAt});
+
+typedef PlayCountRow = ({String songId, int playCount, DateTime lastPlayed});
+
+class PlayHistoryDatabase {
+  PlayHistoryDatabase(this._owner, {this.userId});
+
+  static const _plays = 'SongPlays';
+  static const _songs = 'PlayedSongs';
+  static const localSource = 'local';
+
+  final DownloadDatabase _owner;
+  final String? userId;
+
+  Future<Database> get _database => _owner.database;
+
+  String get _serverId => _owner.serverId;
+
+  Future<void> addPlays(
+    Iterable<SongPlay> plays, {
+    String source = localSource,
+  }) async {
+    final userId = this.userId;
+    if (userId == null || plays.isEmpty) return;
+    final db = await _database;
+    final batch = db.batch();
+    final updatedAt = DateTime.now().toUtc().millisecondsSinceEpoch;
+    for (final play in plays) {
+      if (play.song.externalIds.containsKey('spokenCategory')) continue;
+      batch.insert(_plays, {
+        'ServerId': _serverId,
+        'UserId': userId,
+        'SongId': play.song.id,
+        'PlayedAt': play.playedAt.toUtc().millisecondsSinceEpoch,
+        'Source': source,
+      }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      _snapshot(batch, play.song, updatedAt);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  Future<void> saveSongs(Iterable<LibraryItem> songs) async {
+    if (songs.isEmpty) return;
+    final db = await _database;
+    final batch = db.batch();
+    final updatedAt = DateTime.now().toUtc().millisecondsSinceEpoch;
+    for (final song in songs) {
+      _snapshot(batch, song, updatedAt);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  void _snapshot(Batch batch, LibraryItem song, int updatedAt) {
+    batch.insert(_songs, {
+      'ServerId': _serverId,
+      'SongId': song.id,
+      'Item': jsonEncode(
+        song.copyWith(userData: const PlaybackUserData()).toJson(),
+      ),
+      'UpdatedAt': updatedAt,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<PlayCountRow>> topPlayed({
+    required Duration window,
+    required int limit,
+    int minPlays = 1,
+    DateTime Function() now = DateTime.now,
+  }) async {
+    final userId = this.userId;
+    if (userId == null) return const [];
+    final db = await _database;
+    final rows = await db.rawQuery(
+      'SELECT SongId, COUNT(*) AS PlayCount, MAX(PlayedAt) AS LastPlayed '
+      'FROM $_plays WHERE ServerId = ? AND UserId = ? AND PlayedAt >= ? '
+      'GROUP BY SongId HAVING PlayCount >= ? '
+      'ORDER BY PlayCount DESC, LastPlayed DESC LIMIT ?',
+      [
+        _serverId,
+        userId,
+        now().toUtc().subtract(window).millisecondsSinceEpoch,
+        minPlays,
+        limit,
+      ],
+    );
+    return [
+      for (final row in rows)
+        (
+          songId: row['SongId']! as String,
+          playCount: row['PlayCount']! as int,
+          lastPlayed: DateTime.fromMillisecondsSinceEpoch(
+            row['LastPlayed']! as int,
+            isUtc: true,
+          ),
+        ),
+    ];
+  }
+
+  Future<int> trackedSongCount({
+    required Duration window,
+    int minPlays = 1,
+    DateTime Function() now = DateTime.now,
+  }) async {
+    final userId = this.userId;
+    if (userId == null) return 0;
+    final db = await _database;
+    final rows = await db.rawQuery(
+      'SELECT COUNT(*) AS TrackedCount FROM '
+      '(SELECT SongId FROM $_plays '
+      'WHERE ServerId = ? AND UserId = ? AND PlayedAt >= ? '
+      'GROUP BY SongId HAVING COUNT(*) >= ?)',
+      [
+        _serverId,
+        userId,
+        now().toUtc().subtract(window).millisecondsSinceEpoch,
+        minPlays,
+      ],
+    );
+    return Sqflite.firstIntValue(rows) ?? 0;
+  }
+
+  /// Frequently heard in the past, with no plays inside the recent window.
+  /// Filter MAX(PlayedAt), rather than filtering individual old rows first:
+  /// otherwise a song played yesterday would incorrectly look forgotten.
+  Future<List<PlayCountRow>> forgottenFavourites({
+    int limit = 18,
+    int minPlays = 3,
+    Duration absentFor = const Duration(days: 30),
+    DateTime Function() now = DateTime.now,
+  }) async {
+    if (userId == null) return const [];
+    final db = await _database;
+    final rows = await db.rawQuery(
+      'SELECT SongId, COUNT(*) AS PlayCount, MAX(PlayedAt) AS LastPlayed '
+      'FROM $_plays WHERE ServerId = ? AND UserId = ? '
+      'GROUP BY SongId HAVING COUNT(*) >= ? AND MAX(PlayedAt) < ? '
+      'ORDER BY PlayCount DESC, LastPlayed DESC LIMIT ?',
+      [
+        _serverId,
+        userId,
+        minPlays,
+        now().toUtc().subtract(absentFor).millisecondsSinceEpoch,
+        limit,
+      ],
+    );
+    return [
+      for (final row in rows)
+        (
+          songId: row['SongId']! as String,
+          playCount: row['PlayCount']! as int,
+          lastPlayed: DateTime.fromMillisecondsSinceEpoch(
+            row['LastPlayed']! as int,
+            isUtc: true,
+          ),
+        ),
+    ];
+  }
+
+  Future<Map<String, LibraryItem>> playedSongsByIds(List<String> ids) async {
+    if (ids.isEmpty) return const {};
+    final db = await _database;
+    final rows = await db.query(
+      _songs,
+      columns: ['SongId', 'Item'],
+      where:
+          'ServerId = ? AND SongId IN '
+          '(${List.filled(ids.length, '?').join(',')})',
+      whereArgs: [_serverId, ...ids],
+    );
+    return {
+      for (final row in rows)
+        row['SongId']! as String: LibraryItem.fromJson(
+          jsonDecode(row['Item']! as String) as Map<String, dynamic>,
+        ),
+    };
+  }
+
+  Future<void> deleteAll() async {
+    final db = await _database;
+    await db.delete(_plays, where: 'ServerId = ?', whereArgs: [_serverId]);
+    await db.delete(_songs, where: 'ServerId = ?', whereArgs: [_serverId]);
+  }
+}

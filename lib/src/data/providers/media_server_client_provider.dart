@@ -1,0 +1,36 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/main.dart';
+import 'package:jplayer/src/data/backend/media_server_backends.dart';
+import 'package:jplayer/src/data/backend/media_server_client.dart';
+import 'package:jplayer/src/data/providers/providers.dart';
+import 'package:jplayer/src/data/services/server_probe_service.dart';
+import 'package:jplayer/src/domain/providers/current_user_provider.dart';
+import 'package:jplayer/src/providers/base_url_provider.dart';
+import 'package:jplayer/src/providers/current_server_type_provider.dart';
+import 'package:jplayer/src/data/backend/subsonic/linked_subsonic_client.dart';
+import 'package:jplayer/src/domain/providers/spoken_audio_provider.dart';
+
+final mediaServerClientProvider = Provider<MediaServerClient>((ref) {
+  final user = ref.watch(currentUserProvider);
+  final baseUrl = ref.watch(baseUrlProvider) ?? '';
+  final serverType =
+      ref.watch(currentServerTypeProvider) ?? ServerType.jellyfin;
+  if (serverType == ServerType.subsonic) {
+    return LinkedSubsonicClient(
+      dio: ref.watch(dioProvider),
+      baseUrl: baseUrl,
+      userId: user?.userId ?? '',
+      token: user?.token ?? '',
+      deviceId: deviceId,
+      spoken: ref.watch(spokenAudioServiceProvider),
+    );
+  }
+  return clientFor(
+    serverType,
+    dio: ref.watch(dioProvider),
+    baseUrl: baseUrl,
+    userId: user?.userId ?? '',
+    token: user?.token ?? '',
+    deviceId: deviceId,
+  );
+});

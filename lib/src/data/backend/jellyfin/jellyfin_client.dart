@@ -1,0 +1,860 @@
+import 'package:dio/dio.dart';
+import 'package:jplayer/src/core/network/server_location.dart';
+import 'package:jplayer/src/core/audio/audio_container_mime.dart';
+import 'package:jplayer/src/core/audio/audio_stream_profile.dart';
+import 'package:jplayer/src/core/audio/stream_target_profile.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/core/listenbrainz/listenbrainz_client.dart';
+import 'package:jplayer/src/data/api/api.dart';
+import 'package:jplayer/src/data/backend/item_image_ref.dart';
+import 'package:jplayer/src/data/backend/genre_playlists.dart';
+import 'package:jplayer/src/data/backend/letter_index.dart';
+import 'package:jplayer/src/data/backend/library_query.dart';
+import 'package:jplayer/src/data/backend/jellyfin/mappers/jellyfin_item_mapper.dart';
+import 'package:jplayer/src/data/backend/mappers/lyrics_dto_mapper.dart';
+import 'package:jplayer/src/data/backend/media_server_capabilities.dart';
+import 'package:jplayer/src/data/backend/media_server_client.dart';
+import 'package:jplayer/src/data/backend/media_server_exception.dart';
+import 'package:jplayer/src/data/backend/mediabrowser_home.dart';
+import 'package:jplayer/src/data/backend/mediabrowser_query.dart';
+import 'package:jplayer/src/data/backend/mediabrowser_top_songs.dart';
+import 'package:jplayer/src/data/backend/playback_report.dart';
+import 'package:jplayer/src/data/backend/playlist_songs_batch.dart';
+import 'package:jplayer/src/data/backend/remote_access.dart';
+import 'package:jplayer/src/data/backend/stream_source.dart';
+import 'package:jplayer/src/data/dto/dto.dart';
+import 'package:jplayer/src/data/params/params.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:retrofit/retrofit.dart';
+
+class JellyfinClient implements MediaServerClient {
+  JellyfinClient({
+    required Dio dio,
+    required String baseUrl,
+    required this.userId,
+    required this.token,
+    required this.deviceId,
+    ListenBrainzClient? listenBrainz,
+  }) : _api = JellyfinApi(dio, baseUrl: baseUrl),
+       _dio = dio,
+       _baseUrl = baseUrl,
+       _listenBrainz = listenBrainz ?? ListenBrainzClient();
+
+  static const _defaultImageSize = 420;
+  static const _lossyBitRateCeiling = 256;
+  static const _sizeParams = {'fillHeight', 'fillWidth'};
+
+  @override
+  MediaServerCapabilities get capabilities => const MediaServerCapabilities(
+    ratings: true,
+    artistScopes: {ArtistScope.albumArtists, ArtistScope.allArtists},
+  );
+
+  @override
+  Future<MediaServerCapabilities> resolveCapabilities() async {
+    final cached = _resolved;
+    if (cached != null) return cached;
+    try {
+      await _dio.get<Object?>('$_baseUrl/$_audioMusePath/info');
+      return _resolved = capabilities.copyWith(soundSearch: true);
+    } on DioException {
+      return _resolved = capabilities;
+    }
+  }
+
+  static const _audioMusePath = 'AudioMuseAI';
+
+  MediaServerCapabilities? _resolved;
+
+  final JellyfinApi _api;
+  final Dio _dio;
+  final String _baseUrl;
+  final ListenBrainzClient _listenBrainz;
+  final String userId;
+  final String token;
+  final String deviceId;
+
+  @override
+  Future<LibraryPage> getAlbums(LibraryQuery query) async {
+    final response = await _albumsResponse(query);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  Future<HttpResponse<ItemsWrapper>> _albumsResponse(
+    LibraryQuery query, {
+    String? nameLessThan,
+  }) => _api.getAlbums(
+    userId: userId,
+    libraryId: query.libraryId,
+    startIndex: '${query.startIndex}',
+    limit: '${query.limit}',
+    sortBy: mediaBrowserSort(query.sort),
+    contributingArtistIds: query.appearsOnArtistId,
+    sortOrder: mediaBrowserSortOrder(query.direction),
+    artistIds: query.artistIds,
+    genreIds: query.genreIds,
+    filters: mediaBrowserFilters(query.filters),
+    ids: query.ids,
+    fields: mediaBrowserFields(albumListFields),
+    nameLessThan: nameLessThan,
+  );
+
+  @override
+  Future<LibraryPage> getArtists(LibraryQuery query) async {
+    final response = await _artistsResponse(query);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  Future<HttpResponse<ItemsWrapper>> _artistsResponse(
+    LibraryQuery query, {
+    String? nameLessThan,
+  }) => switch (query.artistScope) {
+    ArtistScope.albumArtists => _api.getAlbumArtists(
+      userId: userId,
+      libraryId: query.libraryId,
+      startIndex: '${query.startIndex}',
+      limit: '${query.limit}',
+      sortBy: mediaBrowserSort(query.sort, target: ItemKind.artist),
+      sortOrder: mediaBrowserSortOrder(query.direction),
+      filters: mediaBrowserFilters(query.filters),
+      nameLessThan: nameLessThan,
+    ),
+    ArtistScope.allArtists => _api.getArtists(
+      userId: userId,
+      libraryId: query.libraryId,
+      startIndex: '${query.startIndex}',
+      limit: '${query.limit}',
+      sortBy: mediaBrowserSort(query.sort, target: ItemKind.artist),
+      sortOrder: mediaBrowserSortOrder(query.direction),
+      filters: mediaBrowserFilters(query.filters),
+      nameLessThan: nameLessThan,
+    ),
+  };
+
+  @override
+  Future<LibraryPage> getGenres(LibraryQuery query) async {
+    final response = await _genresResponse(query);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  Future<HttpResponse<ItemsWrapper>> _genresResponse(
+    LibraryQuery query, {
+    String? nameLessThan,
+  }) => _api.getGenres(
+    userId: userId,
+    libraryId: query.libraryId,
+    startIndex: '${query.startIndex}',
+    limit: '${query.limit}',
+    sortBy: mediaBrowserSort(query.sort, target: ItemKind.genre),
+    sortOrder: mediaBrowserSortOrder(query.direction),
+    nameLessThan: nameLessThan,
+  );
+
+  @override
+  Future<LibraryPage> getPlaylists(LibraryQuery query) async {
+    final response = await _playlistsResponse(query);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  Future<HttpResponse<ItemsWrapper>> _playlistsResponse(
+    LibraryQuery query, {
+    String? nameLessThan,
+  }) => _api.getPlaylists(
+    userId: userId,
+    startIndex: '${query.startIndex}',
+    limit: '${query.limit}',
+    sortBy: mediaBrowserSort(query.sort, target: ItemKind.playlist),
+    contributingArtistIds: query.appearsOnArtistId,
+    sortOrder: mediaBrowserSortOrder(query.direction),
+    artistIds: query.artistIds,
+    filters: mediaBrowserFilters(query.filters),
+    nameLessThan: nameLessThan,
+  );
+
+  @override
+  Future<LibraryPage> getAllSongs(LibraryQuery query) async {
+    final response = await _songsResponse(query);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  Future<HttpResponse<ItemsWrapper>> _songsResponse(
+    LibraryQuery query, {
+    String? nameLessThan,
+  }) => _api.getAllSongs(
+    userId: userId,
+    libraryId: query.libraryId,
+    startIndex: '${query.startIndex}',
+    limit: '${query.limit}',
+    sortBy: mediaBrowserSort(query.sort, target: ItemKind.song),
+    sortOrder: mediaBrowserSortOrder(query.direction),
+    filters: mediaBrowserFilters(query.filters),
+    fields: mediaBrowserFields(query.fields),
+    nameLessThan: nameLessThan,
+  );
+
+  @override
+  Future<LetterOffset?> letterOffset(
+    ItemKind kind,
+    LibraryQuery query,
+    String letter,
+  ) {
+    if (query.sort != ItemSort.name || !_countableKinds.contains(kind)) {
+      return Future.value();
+    }
+    final probe = query.copyWith(startIndex: 0, limit: 1);
+    return letterOffsetWith(
+      letter: letter,
+      direction: query.direction,
+      countBefore: (bound) => _countItems(kind, probe, nameLessThan: bound),
+      total: () => _countItems(kind, probe),
+    );
+  }
+
+  static const _countableKinds = {
+    ItemKind.album,
+    ItemKind.artist,
+    ItemKind.genre,
+    ItemKind.playlist,
+    ItemKind.song,
+  };
+
+  Future<int> _countItems(
+    ItemKind kind,
+    LibraryQuery query, {
+    String? nameLessThan,
+  }) async {
+    final response = await switch (kind) {
+      ItemKind.album => _albumsResponse(query, nameLessThan: nameLessThan),
+      ItemKind.artist => _artistsResponse(query, nameLessThan: nameLessThan),
+      ItemKind.genre => _genresResponse(query, nameLessThan: nameLessThan),
+      ItemKind.playlist => _playlistsResponse(
+        query,
+        nameLessThan: nameLessThan,
+      ),
+      _ => _songsResponse(query, nameLessThan: nameLessThan),
+    };
+    return response.data.totalRecordCount;
+  }
+
+  @override
+  Future<LibraryPage> getSongs(String albumId) async {
+    final response = await _api.getSongs(userId: userId, albumId: albumId);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<LibraryPage> getSongsOfSet(LibraryQuery query) async {
+    final response = await _api.getSongsOfSet(
+      userId: userId,
+      libraryId: query.libraryId,
+      artistIds: query.artistIds,
+      genreIds: query.genreIds,
+      filters: mediaBrowserFilters(query.filters),
+      sortBy: mediaBrowserSort(query.sort, target: ItemKind.song),
+      sortOrder: mediaBrowserSortOrder(query.direction),
+      startIndex: '${query.startIndex}',
+      limit: '${query.limit}',
+      fields: mediaBrowserFields(query.fields),
+    );
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<LibraryPage> getPlaylistSongs(String playlistId) async {
+    final ids = await _playlistItemIds(playlistId);
+    if (ids == null) return _playlistSongsPage(playlistId);
+    final songs = <LibraryItem>[];
+    await _hydratePlaylist(ids).forEach((batch) => songs.addAll(batch.songs));
+    return LibraryPage(items: songs, totalRecordCount: songs.length);
+  }
+
+  @override
+  Stream<PlaylistSongsBatch> streamPlaylistSongs(String playlistId) async* {
+    final ids = await _playlistItemIds(playlistId);
+    if (ids == null) {
+      final songs = (await _playlistSongsPage(playlistId)).items;
+      yield PlaylistSongsBatch(songs: songs, expectedTotal: songs.length);
+      return;
+    }
+    yield* _hydratePlaylist(ids);
+  }
+
+  static const _itemFields = [
+    'MediaSources',
+    'ArtistItems',
+    'ProviderIds',
+    'Overview',
+    'Genres',
+  ];
+
+  static const _playlistBatchSize = 100;
+  static const _playlistBatchConcurrency = 2;
+  static const _playlistSongFields = [
+    'MediaSources',
+    'ArtistItems',
+    'ProviderIds',
+  ];
+
+  Future<LibraryPage> _playlistSongsPage(String playlistId) async {
+    final response = await _api.getPlaylistSongs(
+      playlistId: playlistId,
+      userId: userId,
+    );
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  Future<List<String>?> _playlistItemIds(String playlistId) async {
+    final Response<Map<String, dynamic>> response;
+    try {
+      response = await _dio.getUri<Map<String, dynamic>>(
+        _resolve('Playlists/$playlistId', const {}),
+      );
+    } on DioException catch (error) {
+      if (MediaServerException.fromDio(error).isNotFound) return null;
+      rethrow;
+    }
+    final ids = response.data?['ItemIds'];
+    if (ids is! List) return null;
+    return [
+      for (final id in ids)
+        if (id is String && id.isNotEmpty) id,
+    ];
+  }
+
+  Stream<PlaylistSongsBatch> _hydratePlaylist(List<String> ids) async* {
+    final batches = [
+      for (var start = 0; start < ids.length; start += _playlistBatchSize)
+        ids.skip(start).take(_playlistBatchSize).toList(),
+    ];
+    for (
+      var start = 0;
+      start < batches.length;
+      start += _playlistBatchConcurrency
+    ) {
+      final round = batches.skip(start).take(_playlistBatchConcurrency);
+      final pages = await Future.wait([
+        for (final batch in round) _playlistBatch(batch),
+      ]);
+      yield PlaylistSongsBatch(
+        songs: [for (final page in pages) ...page],
+        expectedTotal: ids.length,
+      );
+    }
+  }
+
+  Future<List<LibraryItem>> _playlistBatch(List<String> ids) async {
+    final response = await _api.getItemsByIds(
+      userId: userId,
+      ids: ids.join(','),
+      fields: _playlistSongFields,
+    );
+    final byId = {
+      for (final item in response.data.items)
+        item.id: item.toJellyfinLibraryItem(),
+    };
+    return [
+      for (final id in ids)
+        if (byId[id] case final item?) item,
+    ];
+  }
+
+  @override
+  Future<LibraryPage> getSimilarAlbums(String albumId, {int limit = 12}) async {
+    final response = await _api.getSimilarAlbums(
+      albumId: albumId,
+      userId: userId,
+      limit: '$limit',
+    );
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<List<LibraryItem>> getInstantMix(
+    String itemId, {
+    int limit = 100,
+  }) async {
+    final response = await _api.getInstantMix(
+      itemId: itemId,
+      userId: userId,
+      limit: '$limit',
+    );
+    return response.data.toJellyfinLibraryPage().items;
+  }
+
+  @override
+  Future<List<LibraryItem>> getTopSongs(LibraryItem artist, {int limit = 10}) =>
+      mediaBrowserTopSongs(
+        this,
+        artist,
+        listenBrainz: _listenBrainz,
+        limit: limit,
+      );
+
+  @override
+  Future<List<LibraryItem>> getLatestAlbums({
+    String? libraryId,
+    int limit = 20,
+  }) async {
+    final response = await _api.getLatestItems(
+      userId: userId,
+      libraryId: libraryId,
+      limit: '$limit',
+    );
+    return [
+      for (final item in response.data)
+        if (item.type == 'MusicAlbum') item.toJellyfinLibraryItem(),
+    ];
+  }
+
+  @override
+  Future<List<LibraryItem>> getRecentReleases({
+    String? libraryId,
+    int limit = 20,
+  }) => mediaBrowserRecentReleases(this, libraryId: libraryId, limit: limit);
+
+  @override
+  Future<List<LibraryItem>> getRecentlyPlayedAlbums({
+    String? libraryId,
+    int limit = 20,
+  }) => mediaBrowserRecentlyPlayedAlbums(
+    this,
+    libraryId: libraryId,
+    limit: limit,
+  );
+
+  @override
+  Future<List<LibraryItem>> getMostPlayedAlbums({
+    String? libraryId,
+    int limit = 20,
+  }) => mediaBrowserMostPlayedAlbums(this, libraryId: libraryId, limit: limit);
+
+  @override
+  Future<List<GeneratedPlaylist>> generateTodaysPlaylists({
+    String? libraryId,
+    bool includeDiscovery = false,
+  }) => generateGenrePlaylists(
+    this,
+    libraryId: libraryId,
+    includeDiscovery: includeDiscovery,
+  );
+
+  @override
+  Future<List<LibraryItem>> getGeneratedPlaylistSongs({
+    required String playlistId,
+    String? libraryId,
+  }) => fetchGenrePlaylistSongs(
+    this,
+    playlistId: playlistId,
+    libraryId: libraryId,
+  );
+
+  @override
+  Future<LibraryPage> getLibraries() async {
+    final response = await _api.getLibraries(userId: userId);
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<List<LibraryItem>> getItemsByIds(List<String> ids) async {
+    if (ids.isEmpty) return const [];
+
+    final pages = await mediaBrowserFetchByIds(
+      ids,
+      (batch) => _api.getItemsByIds(userId: userId, ids: batch.join(',')),
+    );
+    final byId = {
+      for (final page in pages)
+        for (final item in page.data.items)
+          item.id: item.toJellyfinLibraryItem(),
+    };
+
+    return [
+      for (final id in ids)
+        if (byId[id] case final item?) item,
+    ];
+  }
+
+  @override
+  Future<LibraryItem> getItem(String itemId, {required ItemKind kind}) async {
+    final response = await _api.getItem(
+      itemId: itemId,
+      fields: _itemFields,
+    );
+    return response.data.toJellyfinLibraryItem();
+  }
+
+  @override
+  Future<LibraryPage> searchAlbums(SearchQuery query) async {
+    final response = await _api.searchAlbums(
+      userId: userId,
+      searchTerm: query.term,
+      libraryId: query.libraryId,
+      startIndex: '${query.startIndex}',
+      limit: '${query.limit}',
+      sortOrder: mediaBrowserSortOrder(query.direction),
+    );
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<LibraryPage> searchArtists(SearchQuery query) async {
+    final response = switch (query.artistScope) {
+      ArtistScope.albumArtists => await _api.searchAlbumArtists(
+        userId: userId,
+        searchTerm: query.term,
+        libraryId: query.libraryId,
+        startIndex: '${query.startIndex}',
+        limit: '${query.limit}',
+        sortOrder: mediaBrowserSortOrder(query.direction),
+      ),
+      ArtistScope.allArtists => await _api.searchArtists(
+        userId: userId,
+        searchTerm: query.term,
+        libraryId: query.libraryId,
+        startIndex: '${query.startIndex}',
+        limit: '${query.limit}',
+        sortOrder: mediaBrowserSortOrder(query.direction),
+      ),
+    };
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<LibraryPage> searchSongs(SearchQuery query) async {
+    final response = await _api.searchSongs(
+      userId: userId,
+      searchTerm: query.term,
+      libraryId: query.libraryId,
+      startIndex: '${query.startIndex}',
+      limit: '${query.limit}',
+      sortOrder: mediaBrowserSortOrder(query.direction),
+    );
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<LibraryPage> searchPlaylists(SearchQuery query) async {
+    final response = await _api.searchPlaylists(
+      userId: userId,
+      libraryId: query.libraryId ?? '',
+      searchTerm: query.term,
+      startIndex: '${query.startIndex}',
+      limit: '${query.limit}',
+      sortOrder: mediaBrowserSortOrder(query.direction),
+    );
+    return response.data.toJellyfinLibraryPage();
+  }
+
+  @override
+  Future<List<LibraryItem>> searchBySound(
+    String query, {
+    int limit = 50,
+  }) async {
+    final Response<Object?> response;
+    try {
+      response = await _dio.post<Object?>(
+        '$_baseUrl/$_audioMusePath/clap/search',
+        data: {'query': query, 'limit': limit},
+      );
+    } on DioException catch (error) {
+      if (const {400, 503}.contains(error.response?.statusCode)) {
+        return const [];
+      }
+      rethrow;
+    }
+    final body = response.data;
+    if (body is! Map) return const [];
+    final results = body['results'];
+    if (results is! List) return const [];
+    final ids = [
+      for (final result in results)
+        if (result case {'item_id': final String id}) id,
+    ];
+    return getItemsByIds(ids);
+  }
+
+  @override
+  Future<void> setFavorite(String itemId, {required bool favorite}) async {
+    if (favorite) {
+      await _api.saveFavorite(userId: userId, itemId: itemId);
+    } else {
+      await _api.removeFavorite(userId: userId, itemId: itemId);
+    }
+  }
+
+  @override
+  Future<void> setRating(String itemId, int rating) async {
+    if (rating <= 0) {
+      await _api.deleteRating(itemId: itemId, userId: userId);
+      return;
+    }
+    await _api.updateUserData(
+      itemId: itemId,
+      userId: userId,
+      userData: {'Rating': jellyfinRating(rating)},
+    );
+  }
+
+  @override
+  Future<void> createPlaylist(PlaylistData values) async {
+    await _api.createPlaylist(values: values);
+  }
+
+  @override
+  Future<void> deletePlaylist(String playlistId) async {
+    await _api.deletePlaylist(playlistId: playlistId);
+  }
+
+  @override
+  Future<void> addPlaylistItems({
+    required String playlistId,
+    required List<String> itemIds,
+  }) async {
+    await _api.addPlaylistItems(
+      playlistId: playlistId,
+      userId: userId,
+      entryIds: itemIds.join(','),
+    );
+  }
+
+  @override
+  Future<void> removePlaylistItem({
+    required String playlistId,
+    required String entryId,
+  }) async {
+    await _api.removePlaylistItem(playlistId: playlistId, entryIds: entryId);
+  }
+
+  @override
+  Future<Lyrics?> getLyrics(String itemId) async {
+    try {
+      final response = await _api.getLyrics(itemId: itemId);
+      return response.data.toLyrics();
+    } on DioException catch (e) {
+      if (MediaServerException.fromDio(e).isNotFound) return null;
+      rethrow;
+    }
+  }
+
+  @override
+  Future<StreamSource> resolveStreamSource(
+    LibraryItem song, {
+    required String playSessionId,
+    required StreamTargetProfile target,
+    bool forceTranscode = false,
+    Duration? startPosition,
+  }) async {
+    final radio = radioStreamSource(song);
+    if (radio != null) return radio;
+
+    final audioSource = song.audioSources.firstOrNull;
+
+    final profile = AudioStreamProfile.forSource(
+      target: target,
+      sourceContainer: audioSource?.container,
+      sourceCodec: audioSource?.codec,
+      sourceBitRate: audioSource?.bitRate,
+      sourceSampleRate: audioSource?.sampleRate,
+      sourceBitDepth: audioSource?.bitDepth,
+      sourceChannels: audioSource?.channels,
+    );
+
+    final useHls = target.supportsHls && (forceTranscode || profile.useHls);
+    final transcodes = forceTranscode || profile.requiresTranscode;
+    final transcodingContainer = useHls
+        ? profile.transcodingContainer
+        : _progressiveContainer(profile.transcodingContainer);
+    final outputContainer = transcodes
+        ? transcodingContainer
+        : profile.outputContainer;
+
+    final location = Uri(
+      path: useHls
+          ? 'Audio/${song.id}/main.m3u8'
+          : target.extensionInPath
+          ? 'Audio/${song.id}/stream.$outputContainer'
+          : 'Audio/${song.id}/universal',
+      queryParameters: {
+        'UserId': userId,
+        'ApiKey': token,
+        'DeviceId': deviceId,
+        'PlaySessionId': playSessionId,
+        'MediaSourceId': audioSource?.id ?? song.id,
+        'AudioCodec': profile.transcodingAudioCodec,
+        if (profile.bitRateCap case final int kbps when transcodes) ...{
+          'MaxStreamingBitrate': '${kbps * 1000}',
+          'AudioBitRate': '${kbps * 1000}',
+        },
+        if (profile.sampleRateCap case final int hz when transcodes)
+          'AudioSampleRate': '$hz',
+        if (profile.channelCap case final int channels when transcodes)
+          'TranscodingMaxAudioChannels': '$channels',
+        if (useHls) ...{
+          'SegmentContainer': profile.hlsSegmentContainer,
+          'TranscodeReasons': 'AudioCodecNotSupported',
+          if (startPosition != null)
+            'StartTimeTicks': '${startPosition.inMicroseconds * 10}',
+        } else if (target.extensionInPath) ...{
+          'static': transcodes ? 'false' : 'true',
+        } else ...{
+          'TranscodingProtocol': 'http',
+          'TranscodingContainer': transcodingContainer,
+          if (!forceTranscode) 'Container': profile.directPlayContainers,
+        },
+      },
+    );
+    final uri = joinServerLocation(_baseUrl, location);
+
+    final delivered = profile.deliveredQuality(
+      audioSource,
+      transcodes: transcodes,
+      bitRateCeiling: _lossyBitRateCeiling,
+    );
+
+    return StreamSource(
+      uri: uri,
+      location: location,
+      isHls: useHls,
+      outputContainer: outputContainer,
+      mimeType: useHls
+          ? mimeTypeForContainer('m3u8')
+          : mimeTypeForContainer(outputContainer),
+      requiresTranscode: transcodes,
+      delivered: transcodes && !useHls
+          ? delivered.copyWith(container: outputContainer)
+          : delivered,
+    );
+  }
+
+  static String _progressiveContainer(String container) =>
+      container == 'm4a' ? 'aac' : container;
+
+  @override
+  Uri? imageUri(
+    LibraryItem item, {
+    ImageKind kind = ImageKind.primary,
+    int? size,
+  }) {
+    final ref = ItemImageRef.resolve(item, kind);
+    if (ref == null) return null;
+
+    final imageType = kind == ImageKind.backdrop ? 'Backdrop' : 'Primary';
+    final pixels = size ?? _defaultImageSize;
+    return _resolve('Items/${ref.id}/Images/$imageType', {
+      'fillHeight': '$pixels',
+      'fillWidth': '$pixels',
+      'quality': '96',
+      'tag': ref.tag,
+    });
+  }
+
+  @override
+  Uri resizedImageUri(Uri uri, int size) {
+    final params = uri.queryParameters;
+    if (params.isEmpty) return uri;
+    return uri.replace(
+      queryParameters: {
+        for (final entry in params.entries)
+          entry.key: _sizeParams.contains(entry.key) ? '$size' : entry.value,
+      },
+    );
+  }
+
+  Uri _resolve(String path, Map<String, String> queryParameters) {
+    final base = Uri.parse(_baseUrl);
+    final prefix = base.path.replaceAll(RegExp(r'/+$'), '');
+    return base.replace(
+      path: '$prefix/$path',
+      queryParameters: queryParameters,
+    );
+  }
+
+  @override
+  Future<void> reportPlaybackStarted(PlaybackReport report) async {
+    await _api.playbackStarted(values: _toPlaystateData(report));
+  }
+
+  @override
+  Future<void> reportPlaybackProgress(PlaybackReport report) async {
+    await _api.playbackProgress(values: _toPlaystateData(report));
+  }
+
+  @override
+  Future<void> reportPlaybackSuspended(PlaybackReport report) async {}
+
+  @override
+  Future<void> reportPlaybackStopped(PlaybackReport report) async {
+    await _api.playbackStopped(values: _toPlaystateData(report));
+  }
+
+  PlaystateData _toPlaystateData(PlaybackReport report) => PlaystateData(
+    playSessionId: report.playSessionId,
+    itemId: report.itemId,
+    mediaSourceId: report.mediaSourceId,
+    positionTicks: report.position != null
+        ? report.position!.inMilliseconds * 10000
+        : null,
+    isPaused: report.isPaused,
+    canSeek: report.canSeek,
+    nowPlayingQueue: report.queueItemIds.isEmpty
+        ? null
+        : [for (final id in report.queueItemIds) QueueItemData(id: id)],
+  );
+
+  @override
+  Future<SessionStatus> validateSession() async {
+    try {
+      await _api.getArtists(userId: userId, limit: '1');
+      return SessionStatus.valid;
+    } on DioException catch (e) {
+      if (MediaServerException.fromDio(e).isUnauthorized) {
+        return SessionStatus.invalid;
+      }
+      return SessionStatus.unreachable;
+    } on Object {
+      return SessionStatus.unreachable;
+    }
+  }
+
+  @override
+  Future<RemoteAccessResult?> remoteAccess() async {
+    try {
+      final response = await _dio.getUri<Map<String, dynamic>>(
+        _resolve('JellyboxRemote/Info', const {}),
+      );
+      final url = response.data?['Url'];
+      final fingerprint = response.data?['Fingerprint'];
+      final reason = response.data?['Reason'];
+      final access =
+          url is String &&
+              url.isNotEmpty &&
+              fingerprint is String &&
+              fingerprint.isNotEmpty
+          ? RemoteAccess(url: url, fingerprint: fingerprint.toLowerCase())
+          : null;
+      return RemoteAccessResult(
+        access: access,
+        denied: access == null && reason is String ? reason : null,
+        notice: _pluginNotice(response.data),
+      );
+    } on DioException catch (error) {
+      if (error.response?.statusCode == 404) return null;
+      rethrow;
+    }
+  }
+
+  PluginNotice? _pluginNotice(Map<String, dynamic>? info) {
+    if (info?['PluginVersion'] is! String) return PluginNotice.outdated;
+    final notice = info?['Notice'];
+    if (notice is! Map<String, dynamic>) return null;
+    final code = notice['Code'];
+    final message = notice['Message'];
+    if (code is! String || message is! String || message.isEmpty) return null;
+    return PluginNotice(code: code, message: message);
+  }
+
+  @override
+  Future<void> signOut() async {
+    await _api.signOut();
+  }
+}

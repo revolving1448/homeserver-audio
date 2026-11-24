@@ -1,0 +1,1011 @@
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:jplayer/resources/entypo_icons.dart';
+import 'package:jplayer/resources/j_player_icons.dart';
+import 'package:jplayer/resources/resources.dart';
+import 'package:jplayer/src/config/routes.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/providers/image_service_provider.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/data/providers/media_server_client_provider.dart';
+import 'package:jplayer/src/data/providers/server_capabilities_provider.dart';
+import 'package:jplayer/src/providers/connectivity_provider.dart';
+import 'package:jplayer/src/domain/providers/cloud_provider.dart';
+import 'package:jplayer/src/domain/providers/player_bar_provider.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/presentation/widgets/marquee_text.dart';
+import 'package:jplayer/src/presentation/widgets/position_slider.dart';
+import 'package:jplayer/src/presentation/widgets/player_time.dart';
+import 'package:jplayer/src/presentation/widgets/widgets.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:modal_bottom_sheet/modal_bottom_sheet.dart';
+import 'package:jplayer/src/presentation/widgets/volume_control.dart';
+import 'package:responsive_builder/responsive_builder.dart';
+
+const _sheetHorizontalPadding = 30.0;
+
+class BottomPlayer extends ConsumerStatefulWidget {
+  const BottomPlayer({super.key});
+
+  @override
+  ConsumerState<BottomPlayer> createState() => _BottomPlayerState();
+}
+
+class _BottomPlayerState extends ConsumerState<BottomPlayer>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _animationController;
+  final _imageProvider = ValueNotifier<ImageProvider?>(null);
+  final _dynamicColors = ValueNotifier<ColorScheme?>(null);
+  final _isPlaying = ValueNotifier<bool>(false);
+  final _queueShown = ValueNotifier<bool>(false);
+  late ThemeData _theme;
+  late MaterialLocalizations _localizations;
+  late EdgeInsets _viewPadding;
+  late Size _screenSize;
+  late bool _isMobile;
+  late bool _isDesktop;
+  late bool _isLandscape;
+  ModalSheetRoute<void>? _sheetRoute;
+
+  Future<void> _onExpand() {
+    if (_isMobile && _isLandscape) {
+      ref.read(landscapePlayerCollapsedProvider.notifier).state = false;
+      return Future<void>.value();
+    }
+    final route = _sheetRoute = ModalSheetRoute<void>(
+      builder: (context) => SafeArea(
+        minimum: EdgeInsets.only(
+          top: _isMobile ? 0 : 20,
+          bottom: _isMobile ? 20 : 60,
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 518),
+          child: ValueListenableBuilder(
+            valueListenable: _dynamicColors,
+            builder: (context, colorScheme, child) => Theme(
+              data: Theme.of(context).copyWith(colorScheme: colorScheme),
+              child: Consumer(
+                builder: (context, ref, _) {
+                  final coveredByLandscapePlayer =
+                      _isMobile &&
+                      MediaQuery.orientationOf(context) ==
+                          Orientation.landscape;
+                  if (coveredByLandscapePlayer ||
+                      !ref.watch(barHasQueueProvider)) {
+                    return const SizedBox.shrink();
+                  }
+                  final currentSong = ref.watch(barMediaItemProvider);
+                  final lyricsExpanded =
+                      _isMobile && ref.watch(lyricsShownProvider);
+                  return Column(
+                    mainAxisSize: MainAxisSize.max,
+                    children: [
+                      _sheetHeader(context),
+                      Expanded(
+                        child: ValueListenableBuilder<bool>(
+                          valueListenable: _queueShown,
+                          builder: (context, showQueue, _) => FlipPanel(
+                            side: showQueue ? FlipSide.right : FlipSide.front,
+                            front: Column(
+                              children: [
+                                Expanded(child: _artworkArea()),
+                                AnimatedSwitcher(
+                                  duration: const Duration(milliseconds: 250),
+                                  transitionBuilder: (child, animation) =>
+                                      SizeTransition(
+                                        sizeFactor: animation,
+                                        axisAlignment: -1,
+                                        child: child,
+                                      ),
+                                  child: lyricsExpanded
+                                      ? const SizedBox(width: double.infinity)
+                                      : _sheetDetails(context, currentSong),
+                                ),
+                              ],
+                            ),
+                            right: const NowPlayingQueueView(),
+                          ),
+                        ),
+                      ),
+                      _extraControls(),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      ),
+      containerBuilder: (context, animation, child) => LayoutBuilder(
+        builder: (context, constraints) => ValueListenableBuilder(
+          valueListenable: _dynamicColors,
+          builder: (context, colorScheme, child) => BottomSheet(
+            animationController: _animationController,
+            onClosing: () {},
+            enableDrag: false,
+            showDragHandle: false,
+            backgroundColor: colorScheme?.background,
+            constraints: BoxConstraints(
+              maxHeight: constraints.maxHeight,
+              minWidth: constraints.maxWidth,
+            ),
+            builder: (context) => child!,
+          ),
+          child: child,
+        ),
+      ),
+      bounce: true,
+      expanded: true,
+      barrierLabel: _localizations.modalBarrierDismissLabel,
+      duration: const Duration(milliseconds: 300),
+    );
+    return Navigator.of(
+      context,
+      rootNavigator: true,
+    ).push(route).whenComplete(_onSheetClosed);
+  }
+
+  void _onSheetClosed() {
+    _sheetRoute = null;
+    _queueShown.value = false;
+    if (mounted) ref.read(lyricsVisibleProvider.notifier).state = false;
+  }
+
+  Widget _artworkArea() => Consumer(
+    builder: (context, ref, child) => AnimatedSwitcher(
+      duration: const Duration(milliseconds: 250),
+      child: ref.watch(lyricsShownProvider)
+          ? Padding(
+              key: const ValueKey('lyrics'),
+              padding: const EdgeInsets.symmetric(
+                horizontal: _sheetHorizontalPadding,
+              ),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  const LyricsView(),
+                  if (_isMobile && supportsLandscapePlayer)
+                    const KeepScreenAwake(force: true),
+                ],
+              ),
+            )
+          : child,
+    ),
+    child: ValueListenableBuilder<bool>(
+      key: const ValueKey('artwork'),
+      valueListenable: _isPlaying,
+      builder: (context, isPlaying, child) => SwipeableArtwork(
+        queue: ref.watch(barMediaQueueProvider),
+        currentIndex: ref.watch(barQueueIndexProvider),
+        borderRadius: _isMobile ? 12 : 16,
+        artworkBuilder: _artwork,
+        horizontalPadding: _sheetHorizontalPadding,
+        scale: isPlaying ? 1 : 0.82,
+      ),
+    ),
+  );
+
+  Widget _sheetHeader(BuildContext context) => SizedBox(
+    height: kMinInteractiveDimension,
+    child: Center(
+      child: Container(
+        width: 113,
+        height: 10,
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+          borderRadius: BorderRadius.circular(5),
+        ),
+      ),
+    ),
+  );
+
+  Widget _queueButton() => ValueListenableBuilder<bool>(
+    valueListenable: _queueShown,
+    builder: (context, isShown, _) => HoverIconButton(
+      onPressed: () => _queueShown.value = !isShown,
+      color: _theme.colorScheme.onPrimary,
+      iconSize: _isMobile ? 26 : 24,
+      tooltip: isShown ? 'Hide queue' : 'Queue',
+      icon: const Icon(Icons.queue_music),
+      selectedIcon: const Icon(Icons.queue_music),
+      isSelected: isShown,
+    ),
+  );
+
+  Widget _sheetDetails(BuildContext context, MediaItem? currentSong) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: _sheetHorizontalPadding),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(height: _isMobile ? 24 : 32),
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (_isMobile)
+                    MarqueeText(
+                      currentSong?.title ?? '',
+                      bounce: true,
+                      style: const TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.w700,
+                        height: 1.2,
+                      ),
+                    )
+                  else
+                    Text(
+                      currentSong?.title ?? '',
+                      style: const TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.w700,
+                        height: 1.2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      maxLines: 1,
+                    ),
+                  const SizedBox(height: 2),
+                  ClickableWidget(
+                    onPressed: currentSong?.extras?['artistId'] != null
+                        ? () async {
+                            final artistId =
+                                currentSong!.extras!['artistId'] as String;
+                            final item = await ref
+                                .read(mediaServerClientProvider)
+                                .getItem(artistId, kind: ItemKind.artist);
+                            if (!context.mounted) return;
+                            Navigator.of(context).pop();
+                            context.goNamed(
+                              Routes.artist.name,
+                              extra: {'artist': item},
+                            );
+                          }
+                        : null,
+                    textStyle: TextStyle(
+                      fontSize: _isMobile ? 16 : 20,
+                      height: 1.2,
+                      color: _theme.colorScheme.primary,
+                    ),
+                    child: Text(
+                      currentSong?.artist ?? '',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Consumer(
+              builder: (context, ref, _) {
+                final isLoaded = ref.watch(barSongProvider) != null;
+                if (!isLoaded) return const SizedBox.shrink();
+                return Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const SizedBox(width: 8),
+                    _moreButton(currentSong),
+                  ],
+                );
+              },
+            ),
+          ],
+        ),
+        SizedBox(height: _isMobile ? 16 : 20),
+        _sheetRatingStars(),
+        const PositionSlider.bar(),
+        PositionLabels.bar(fontSize: _isMobile ? 12 : 13),
+        SizedBox(height: _isMobile ? 8 : 12),
+        AudioQualityBadge.heard(currentSong?.extras),
+        SizedBox(height: _isMobile ? 12 : 24),
+        IconTheme.merge(
+          data: IconThemeData(size: _isMobile ? 40 : 44),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              _randomQueueButton(size: _isMobile ? 20 : 24),
+              _prevTrackButton(size: _isMobile ? 40 : 44),
+              SizedBox.square(
+                dimension: 72,
+                child: _playPauseButton(),
+              ),
+              _nextTrackButton(size: _isMobile ? 40 : 44),
+              _repeatTrackButton(size: _isMobile ? 20 : 24),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _extraControls() => Padding(
+    padding: EdgeInsets.only(
+      left: _sheetHorizontalPadding,
+      right: _sheetHorizontalPadding,
+      top: _isMobile ? 24 : 32,
+    ),
+    child: IconTheme.merge(
+      data: IconThemeData(size: _isMobile ? 26 : 24),
+      child: Consumer(
+        builder: (context, ref, _) {
+          final playingElsewhere = ref.watch(playingElsewhereProvider);
+          return Row(
+            children: [
+              Expanded(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: _playbackTargetButton(showsDeviceName: true),
+                ),
+              ),
+              _lyricsButton(size: _isMobile ? 26 : 24),
+              if (!_isMobile && !playingElsewhere) _downloadTrackButton(),
+              _likeTrackButton(size: _isMobile ? 26 : 24),
+              _queueButton(),
+              _sleepTimerButton(size: _isMobile ? 26 : 24),
+            ],
+          );
+        },
+      ),
+    ),
+  );
+
+  Future<void> _onImageProviderChanged() async {
+    final imageProvider = _imageProvider.value;
+
+    if (imageProvider == null || !mounted) return;
+    try {
+      final colors = await ColorScheme.fromImageProvider(
+        provider: imageProvider,
+        brightness: _theme.brightness,
+      );
+      if (mounted) _dynamicColors.value = colors;
+    } on Object {
+      return;
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _animationController = BottomSheet.createAnimationController(this);
+    _imageProvider.addListener(_onImageProviderChanged);
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => _imageProvider.value = const AssetImage(Images.songSample),
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _theme = Theme.of(context);
+    _localizations = MaterialLocalizations.of(context);
+    _viewPadding = MediaQuery.viewPaddingOf(context);
+    _screenSize = MediaQuery.sizeOf(context);
+
+    _isLandscape = MediaQuery.orientationOf(context) == Orientation.landscape;
+
+    final deviceType = getDeviceType(_screenSize);
+    _isMobile = deviceType == DeviceScreenType.mobile;
+    _isDesktop = deviceType == DeviceScreenType.desktop;
+
+    final route = _sheetRoute;
+    if (_isMobile && _isLandscape && route != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && route.isActive) {
+          Navigator.of(context, rootNavigator: true).removeRoute(route);
+        }
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isPlaying = ref.watch(barPlayingProvider);
+    if (_isPlaying.value != isPlaying) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _isPlaying.value = isPlaying;
+      });
+    }
+    return Consumer(
+      builder: (context, ref, _) {
+        final playingElsewhere = ref.watch(playingElsewhereProvider);
+        final isEmpty = !ref.watch(barHasQueueProvider);
+        final device = _isDesktop ? null : ref.watch(activeDeviceProvider);
+        final currentSong = ref.watch(barMediaItemProvider);
+        final image = ref
+            .read(imageServiceProvider)
+            .artworkImage(currentSong?.artUri);
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => _imageProvider.value = image,
+        );
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 250),
+              transitionBuilder: (child, animation) => SizeTransition(
+                sizeFactor: animation,
+                axisAlignment: -1,
+                child: child,
+              ),
+              child: isEmpty
+                  ? const SizedBox(width: double.infinity)
+                  : Container(
+                      height: (_isMobile ? 69 : 92) + _viewPadding.bottom,
+                      color: _theme.bottomSheetTheme.backgroundColor
+                          ?.withOpacity(0.75),
+                      padding: EdgeInsets.only(bottom: _viewPadding.bottom),
+                      child: SimpleListTile(
+                        onTap: !_isDesktop ? _onExpand : null,
+                        padding: const EdgeInsets.only(right: 8),
+                        leading: AspectRatio(
+                          aspectRatio: 1,
+                          child: _isDesktop
+                              ? MouseRegion(
+                                  cursor: SystemMouseCursors.click,
+                                  child: GestureDetector(
+                                    onTap: _goToCurrentAlbum,
+                                    onSecondaryTapUp: (details) =>
+                                        _showArtworkMenu(
+                                          details.globalPosition,
+                                        ),
+                                    child: _artwork(currentSong),
+                                  ),
+                                )
+                              : _artwork(currentSong),
+                        ),
+                        title: device != null
+                            ? MarqueeText(
+                                [
+                                  if (currentSong?.artist?.isNotEmpty ?? false)
+                                    currentSong!.artist!,
+                                  currentSong?.title ?? '',
+                                ].join(' — '),
+                                bounce: true,
+                                style: TextStyle(
+                                  fontSize: _isMobile ? 16 : 22,
+                                  fontWeight: FontWeight.w500,
+                                  height: 1.2,
+                                ),
+                              )
+                            : Row(
+                                crossAxisAlignment: CrossAxisAlignment.center,
+                                children: [
+                                  Flexible(
+                                    child: _isMobile
+                                        ? MarqueeText(
+                                            currentSong?.title ?? '',
+                                            bounce: true,
+                                            style: const TextStyle(
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.w500,
+                                              height: 1.2,
+                                            ),
+                                          )
+                                        : Text(
+                                            currentSong?.title ?? '',
+                                            style: const TextStyle(
+                                              fontSize: 24,
+                                              fontWeight: FontWeight.w500,
+                                              height: 1.2,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                            maxLines: 1,
+                                          ),
+                                  ),
+                                  if (_isDesktop) const SizedBox(width: 8),
+                                  if (_isDesktop)
+                                    AudioQualityBadge.heard(
+                                      currentSong?.extras,
+                                    ),
+                                  if (_isDesktop)
+                                    _ratingStars(
+                                      size: 16,
+                                      spacing: 2,
+                                      padding: const EdgeInsets.only(left: 8),
+                                    ),
+                                ],
+                              ),
+                        subtitle: device != null
+                            ? _deviceLine(device)
+                            : Align(
+                                alignment: Alignment.centerLeft,
+                                child: ClickableWidget(
+                                  onPressed:
+                                      (_isDesktop &&
+                                          currentSong?.extras?['artistId'] !=
+                                              null)
+                                      ? () async {
+                                          final artistId =
+                                              currentSong!.extras!['artistId']
+                                                  as String;
+                                          final item = await ref
+                                              .read(mediaServerClientProvider)
+                                              .getItem(
+                                                artistId,
+                                                kind: ItemKind.artist,
+                                              );
+                                          if (!context.mounted) return;
+                                          context.goNamed(
+                                            Routes.artist.name,
+                                            extra: {'artist': item},
+                                          );
+                                        }
+                                      : null,
+                                  textStyle: TextStyle(
+                                    fontSize: _isMobile ? 12 : 18,
+                                    height: 1.2,
+                                  ),
+                                  child: Text(
+                                    currentSong?.artist ?? '',
+                                  ),
+                                ),
+                              ),
+                        // Text(
+                        //   currentSong?.displayDescription ?? '',
+                        //   style: TextStyle(
+                        //     fontSize: _isMobile ? 12 : 18,
+                        //     height: 1.2,
+                        //   ),
+                        // ),
+                        trailing: Wrap(
+                          spacing: _isDesktop ? 0 : 8,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            if (_isDesktop) const PlayerTime(),
+                            if (_isDesktop)
+                              _randomQueueButton(size: _barIconSize),
+                            _prevTrackButton(size: _barIconSize),
+                            SizedBox.square(
+                              dimension: _isDesktop ? 38 : 45,
+                              child: IconTheme.merge(
+                                data: IconThemeData(size: _barIconSize),
+                                child: _playPauseButton(),
+                              ),
+                            ),
+                            _nextTrackButton(size: _barIconSize),
+                            if (_isDesktop)
+                              _repeatTrackButton(size: _barIconSize),
+                            if (_isDesktop) _lyricsButton(size: _barIconSize),
+                            if (_isDesktop)
+                              _sleepTimerButton(size: _barIconSize),
+                            if (_isDesktop) const VolumeControl(size: 36),
+                            if (_isDesktop) _playbackTargetButton(size: 36),
+                            if (_isDesktop) _queueSidebarButton(),
+                            if (!_isMobile && !playingElsewhere)
+                              _studioModeButton(),
+                          ],
+                        ),
+                        leadingToTitle: 15,
+                      ),
+                    ),
+            ),
+            if (!isEmpty)
+              ValueListenableBuilder(
+                valueListenable: _dynamicColors,
+                builder: (context, colorScheme, child) => Theme(
+                  data: Theme.of(context).copyWith(
+                    colorScheme: colorScheme,
+                  ),
+                  child: const Positioned(
+                    left: -25,
+                    top: -22,
+                    right: -25,
+                    child: PositionSlider.bar(),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _animationController.dispose();
+    _imageProvider.dispose();
+    _dynamicColors.dispose();
+    _isPlaying.dispose();
+    _queueShown.dispose();
+    super.dispose();
+  }
+
+  Widget _artwork(MediaItem? currentSong) {
+    return SizedBox.expand(
+      key: ValueKey(currentSong?.id),
+      child: Image(
+        image: ref.read(imageServiceProvider).artworkImage(currentSong?.artUri),
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) =>
+            Image.asset(Images.album, fit: BoxFit.cover),
+      ),
+    );
+  }
+
+  Widget _moreButton(MediaItem? currentSong) => HoverIconButton(
+    onPressed: () => _onMorePressed(currentSong),
+    color: _theme.colorScheme.onPrimary,
+    iconSize: _isMobile ? 26 : 24,
+    icon: const Icon(Icons.more_vert),
+  );
+
+  LibraryItem? get _currentQueueSong => ref.read(barSongProvider);
+
+  Widget _sheetRatingStars() => _ratingStars(
+    size: 30,
+    spacing: _isMobile ? 8 : 4,
+    padding: const EdgeInsets.only(bottom: 16),
+    touchPadding: _isMobile
+        ? const EdgeInsets.symmetric(horizontal: 30)
+        : EdgeInsets.zero,
+    alignment: _isMobile ? Alignment.center : Alignment.centerLeft,
+  );
+
+  Widget _ratingStars({
+    required double size,
+    required double spacing,
+    required EdgeInsets padding,
+    EdgeInsets touchPadding = EdgeInsets.zero,
+    Alignment? alignment,
+  }) => Consumer(
+    builder: (context, ref, _) {
+      if (!ref.watch(ratingsEnabledProvider)) {
+        return const SizedBox.shrink();
+      }
+      final song = ref.watch(barSongProvider);
+      final isOffline = ref.watch(isOfflineProvider);
+      final stars = RatingStars(
+        rating: song?.userData.rating ?? 0,
+        size: size,
+        spacing: spacing,
+        touchPadding: touchPadding,
+        color: _theme.colorScheme.primary,
+        emptyColor: _theme.colorScheme.onPrimary.withValues(alpha: 0.35),
+        onChanged: song == null || isOffline
+            ? null
+            : (rating) => _onRateCurrent(song, rating),
+      );
+      return Padding(
+        padding: padding,
+        child: alignment == null
+            ? stars
+            : Align(alignment: alignment, child: stars),
+      );
+    },
+  );
+
+  Future<void> _onRateCurrent(LibraryItem song, int rating) async {
+    final saved = await ref.read(barControlsProvider).rate(song, rating);
+    if (saved) return;
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('This action needs a connection')),
+      );
+    }
+    throw StateError('Rating not saved');
+  }
+
+  Future<void> _onLikeCurrent(LibraryItem song) async {
+    final saved = await ref.read(barControlsProvider).toggleFavourite(song);
+    if (!saved && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('This action needs a connection')),
+      );
+    }
+  }
+
+  Future<void> _onMorePressed(MediaItem? currentSong) async {
+    final song = _currentQueueSong;
+    if (song == null) return;
+    final actions = contextMenuActions(
+      context,
+      ref,
+      song,
+      scope: ContextMenuScope.nowPlaying,
+      onLike: _onLikeCurrent,
+    );
+    await showContextMenuSheet(context, actions: actions);
+  }
+
+  void _showArtworkMenu(Offset position) {
+    final song = _currentQueueSong;
+    if (song == null) return;
+    showContextMenu(
+      context,
+      position: position,
+      actions: contextMenuActions(
+        context,
+        ref,
+        song,
+        scope: ContextMenuScope.nowPlaying,
+        onLike: _onLikeCurrent,
+      ),
+    );
+  }
+
+  Future<void> _goToCurrentAlbum() async {
+    final albumId = _currentQueueSong?.albumId;
+    if (albumId == null) return;
+    final item = await ref
+        .read(mediaServerClientProvider)
+        .getItem(albumId, kind: ItemKind.album);
+    if (!mounted) return;
+    context.goNamed(Routes.album.name, extra: {'album': item});
+  }
+
+  Widget _deviceLine(ActiveDevice device) => Padding(
+    padding: const EdgeInsets.only(top: 4),
+    child: Row(
+      children: [
+        Icon(
+          device.icon,
+          size: _isMobile ? 17 : 21,
+          color: _theme.colorScheme.primary,
+        ),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            device.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: _isMobile ? 14 : 20,
+              height: 1.2,
+              fontWeight: FontWeight.w500,
+              color: _theme.colorScheme.primary,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  double get _barIconSize => _isDesktop ? 20 : 24;
+
+  Widget _playPauseButton() => PlayPauseButton(
+    onPressed: ref.read(barControlsProvider).togglePlay,
+    background: _theme.colorScheme.onPrimary,
+    foreground: _theme.scaffoldBackgroundColor,
+    stateNotifier: _isPlaying,
+  );
+
+  Widget _prevTrackButton({double size = 24}) => HoverIconButton(
+    onPressed: ref.read(barControlsProvider).previous,
+    color: _theme.colorScheme.onPrimary,
+    iconSize: size,
+    icon: const Icon(Entypo.fast_backward),
+  );
+
+  Widget _nextTrackButton({double size = 24}) => HoverIconButton(
+    onPressed: ref.read(barControlsProvider).next,
+    color: _theme.colorScheme.onPrimary,
+    iconSize: size,
+    icon: const Icon(Entypo.fast_forward),
+  );
+
+  Widget _queueSidebarButton() => Consumer(
+    builder: (context, ref, _) {
+      final isShown = ref.watch(queueSidebarVisibleProvider);
+      return SizedBox.square(
+        dimension: 36,
+        child: HoverIconButton(
+          onPressed: () =>
+              ref.read(queueSidebarVisibleProvider.notifier).state = !isShown,
+          color: _theme.colorScheme.onPrimary,
+          style: const ButtonStyle(
+            padding: WidgetStatePropertyAll(EdgeInsets.zero),
+          ),
+          iconSize: _barIconSize,
+          tooltip: isShown ? 'Hide queue' : 'Queue',
+          icon: const Icon(Icons.queue_music),
+          selectedIcon: const Icon(Icons.queue_music),
+          isSelected: isShown,
+        ),
+      );
+    },
+  );
+
+  Widget _studioModeButton() => HoverIconButton(
+    onPressed: () {
+      final settings = ref.read(appSettingsProvider.notifier);
+      if (!settings.isEnabled(AppSetting.studioModeRememberLyrics)) {
+        settings.setEnabled(AppSetting.studioModeLyrics, value: false);
+      }
+      ref.read(lyricsVisibleProvider.notifier).state = false;
+      ref.read(studioModeVisibleProvider.notifier).state = true;
+    },
+    color: _theme.colorScheme.onPrimary,
+    iconSize: _barIconSize,
+    tooltip: 'Studio mode',
+    icon: const Icon(Icons.fullscreen),
+  );
+
+  Widget _randomQueueButton({double size = 24}) => Consumer(
+    builder: (context, ref, child) {
+      final enabled = ref.watch(barShuffleProvider);
+      return HoverIconButton(
+        onPressed: () =>
+            ref.read(barControlsProvider).setShuffle(enabled: !enabled),
+        color: _theme.colorScheme.onPrimary,
+        iconSize: size,
+        icon: const Icon(JPlayer.mix),
+        selectedIcon: const Icon(JPlayer.mix),
+        isSelected: enabled,
+      );
+    },
+  );
+
+  Widget _repeatTrackButton({double size = 24}) => Consumer(
+    builder: (context, ref, _) {
+      final mode = ref.watch(barRepeatProvider);
+      final icon = mode == LoopMode.one
+          ? const _RepeatOneIcon()
+          : const Icon(JPlayer.repeat);
+      return HoverIconButton(
+        onPressed: () => ref.read(barControlsProvider).setRepeat(
+          switch (mode) {
+            LoopMode.off => LoopMode.all,
+            LoopMode.all => LoopMode.one,
+            LoopMode.one => LoopMode.off,
+          },
+        ),
+        color: _theme.colorScheme.onPrimary,
+        iconSize: size,
+        icon: icon,
+        selectedIcon: icon,
+        isSelected: mode != LoopMode.off,
+      );
+    },
+  );
+
+  Widget _sleepTimerButton({double size = 24}) => SleepTimerButton(
+    color: _theme.colorScheme.onPrimary,
+    iconSize: size,
+  );
+
+  Widget _playbackTargetButton({
+    double? size,
+    bool showsDeviceName = false,
+  }) => PlaybackTargetButton(
+    size: size,
+    color: _theme.colorScheme.onPrimary,
+    showsDeviceName: showsDeviceName,
+  );
+
+  Widget _lyricsButton({double size = 24}) => Consumer(
+    builder: (context, ref, _) {
+      final hasLyrics = ref.watch(currentSongHasLyricsProvider);
+      final isShown = ref.watch(lyricsShownProvider);
+      final isLookingUp = ref.watch(lyricsLookupPendingProvider);
+
+      return HoverIconButton(
+        onPressed: hasLyrics || isShown
+            ? () {
+                _queueShown.value = false;
+                ref.read(lyricsVisibleProvider.notifier).state = !isShown;
+              }
+            : null,
+        color: _theme.colorScheme.onPrimary,
+        disabledColor: _theme.colorScheme.onPrimary.withOpacity(0.3),
+        iconSize: size,
+        tooltip: switch ((hasLyrics, isShown)) {
+          (_, true) => 'Hide lyrics',
+          (true, false) => 'Lyrics',
+          (false, false) when isLookingUp => 'Looking for lyrics',
+          (false, false) => 'No lyrics for this track',
+        },
+        icon: isLookingUp
+            ? const LyricsLookupIndicator(icon: Icon(Icons.lyrics_outlined))
+            : const Icon(Icons.lyrics_outlined),
+        selectedIcon: isLookingUp
+            ? const LyricsLookupIndicator(icon: Icon(Icons.lyrics))
+            : const Icon(Icons.lyrics),
+        isSelected: isShown,
+      );
+    },
+  );
+
+  Widget _downloadTrackButton() => Consumer(
+    builder: (context, ref, _) {
+      final currentSong = ref.watch(currentSongProvider);
+
+      if (currentSong == null || currentSong.isRadioStream) {
+        return const SizedBox.shrink();
+      }
+
+      final isDownloaded = ref
+          .watch(isSongDownloadedProvider(currentSong.id))
+          .valueOrNull;
+      final currentTask = ref.watch(songDownloadTaskProvider(currentSong.id));
+
+      if (isDownloaded == true) {
+        return DownloadedIcon(size: _isMobile ? 26 : 24);
+      }
+
+      if (currentTask != null) {
+        return ValueListenableBuilder<DownloadStatus>(
+          valueListenable: currentTask.status,
+          builder: (context, status, _) {
+            if (!currentTask.isDownloadingNow) {
+              return HoverIconButton(
+                onPressed: () =>
+                    ref.read(downloadManagerProvider).downloadSong(currentSong),
+                color: _theme.colorScheme.onPrimary,
+                iconSize: _isMobile ? 26 : 24,
+                icon: const Icon(JPlayer.download),
+              );
+            }
+            return SizedBox.square(
+              dimension: _isMobile ? 28 : 24,
+              child: ValueListenableBuilder<double?>(
+                valueListenable: currentTask.progress,
+                builder: (context, progress, _) => CircularProgressIndicator(
+                  value: progress,
+                  color: _theme.colorScheme.primary,
+                  strokeWidth: 2,
+                ),
+              ),
+            );
+          },
+        );
+      }
+
+      return HoverIconButton(
+        onPressed: () =>
+            ref.read(downloadManagerProvider).downloadSong(currentSong),
+        color: _theme.colorScheme.onPrimary,
+        iconSize: _isMobile ? 26 : 24,
+        icon: const Icon(JPlayer.download),
+      );
+    },
+  );
+
+  Widget _likeTrackButton({double size = 24}) => Consumer(
+    builder: (context, ref, _) {
+      final song = ref.watch(barSongProvider);
+      return HoverIconButton(
+        onPressed: song == null ? null : () => _onLikeCurrent(song),
+        color: _theme.colorScheme.onPrimary,
+        mutedHover: true,
+        iconSize: size,
+        icon: const Icon(CupertinoIcons.heart),
+        selectedIcon: const Icon(CupertinoIcons.heart_fill),
+        isSelected: song?.userData.isFavorite ?? false,
+      );
+    },
+  );
+}
+
+class _RepeatOneIcon extends StatelessWidget {
+  const _RepeatOneIcon();
+
+  @override
+  Widget build(BuildContext context) {
+    final iconTheme = IconTheme.of(context);
+    final size = iconTheme.size ?? 24;
+    return SizedBox.square(
+      dimension: size,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          const Icon(JPlayer.repeat),
+          Text(
+            '1',
+            style: TextStyle(
+              color: iconTheme.color,
+              fontSize: size * 0.42,
+              fontWeight: FontWeight.w800,
+              height: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

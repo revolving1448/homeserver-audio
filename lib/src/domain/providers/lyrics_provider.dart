@@ -1,0 +1,70 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/core/http/user_agent.dart';
+import 'package:jplayer/src/core/lyrics/downloaded_lyrics_source.dart';
+import 'package:jplayer/src/core/lyrics/lrclib_client.dart';
+import 'package:jplayer/src/core/lyrics/lrclib_lyrics_source.dart';
+import 'package:jplayer/src/core/lyrics/lyrics_source.dart';
+import 'package:jplayer/src/core/lyrics/server_lyrics_source.dart';
+import 'package:jplayer/src/data/providers/providers.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/app_settings_provider.dart';
+import 'package:jplayer/src/domain/providers/player_bar_provider.dart';
+import 'package:jplayer/src/domain/providers/studio_mode_provider.dart';
+import 'package:jplayer/src/providers/connectivity_provider.dart';
+
+final lrclibClientProvider = Provider<LrclibClient>(
+  (ref) => LrclibClient(userAgent: jellyboxUserAgent()),
+);
+
+final lyricsSourcesProvider = Provider<List<LyricsSource>>(
+  (ref) => [
+    if (ref.watch(serverCapabilitiesProvider).lyrics)
+      ServerLyricsSource(ref.watch(mediaServerClientProvider)),
+    if (ref.watch(settingProvider(AppSetting.lrclibLyrics)))
+      LrclibLyricsSource(ref.watch(lrclibClientProvider)),
+  ],
+);
+
+final lyricsProvider = FutureProviderFamily<Lyrics?, String>((ref, itemId) {
+  final downloaded = DownloadedLyricsSource(
+    ref.watch(downloadDatabaseProvider).lyricsOf,
+  );
+  final sources = ref.watch(isOfflineProvider)
+      ? [downloaded]
+      : [...ref.watch(lyricsSourcesProvider), downloaded];
+  final song = ref.read(barSongProvider);
+  final request = song != null && song.id == itemId
+      ? LyricsRequest.forSong(song)
+      : LyricsRequest(itemId: itemId);
+  return resolveLyrics(sources, request);
+});
+
+final lrclibRetryingProvider = Provider<bool>((ref) {
+  final retrying = ref.watch(lrclibClientProvider).retrying;
+  void sync() => ref.state = retrying.value;
+  retrying.addListener(sync);
+  ref.onDispose(() => retrying.removeListener(sync));
+  return retrying.value;
+});
+
+final lyricsLookupPendingProvider = Provider<bool>((ref) {
+  final song = ref.watch(barSongProvider);
+  if (song == null || !ref.watch(lrclibRetryingProvider)) return false;
+  return ref.watch(lyricsProvider(song.id)).isLoading;
+});
+
+final lyricsVisibleProvider = StateProvider<bool>((ref) => false);
+
+final currentSongHasLyricsProvider = Provider<bool>((ref) {
+  final song = ref.watch(barSongProvider);
+  if (song == null) return false;
+  final lyrics = ref.watch(lyricsProvider(song.id));
+  if (!lyrics.hasValue) return song.hasLyrics;
+  return lyrics.value?.lines.isNotEmpty ?? false;
+});
+
+final lyricsShownProvider = Provider<bool>((ref) {
+  if (!ref.watch(lyricsVisibleProvider)) return false;
+  if (ref.watch(studioModeVisibleProvider)) return false;
+  return ref.watch(barSongProvider) != null;
+});

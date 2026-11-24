@@ -1,0 +1,27 @@
+// GENERATED CODE - DO NOT MODIFY BY HAND
+
+part of 'media_source_dto.dart';
+
+// **************************************************************************
+// JsonSerializableGenerator
+// **************************************************************************
+
+_MediaSourceDTO _$MediaSourceDTOFromJson(Map<String, dynamic> json) =>
+    _MediaSourceDTO(
+      id: json['Id'] as String?,
+      container: json['Container'] as String?,
+      path: json['Path'] as String?,
+      mediaStreams:
+          (json['MediaStreams'] as List<dynamic>?)
+              ?.map((e) => MediaStreamDTO.fromJson(e as Map<String, dynamic>))
+              .toList() ??
+          const [],
+    );
+
+Map<String, dynamic> _$MediaSourceDTOToJson(_MediaSourceDTO instance) =>
+    <String, dynamic>{
+      'Id': instance.id,
+      'Container': instance.container,
+      'Path': instance.path,
+      'MediaStreams': instance.mediaStreams,
+    };

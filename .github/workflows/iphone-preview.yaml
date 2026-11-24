@@ -1,0 +1,38 @@
+name: Build unsigned iPhone preview
+
+# Manual only. No Apple credentials, signing, App Store or TestFlight upload.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iphone-preview
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.9
+          channel: stable
+          cache: true
+      - name: Prepare and build the personal app
+        run: bash tool/build_homeserver_ios.sh
+      - name: Package for free-account re-signing
+        run: |
+          mkdir -p build/unsigned/Payload
+          ditto build/ios/iphoneos/Runner.app build/unsigned/Payload/Runner.app
+          cd build/unsigned
+          ditto -c -k --keepParent Payload HomeServer-Audio-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HomeServer-Audio-unsigned-iPhone
+          path: build/unsigned/HomeServer-Audio-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7

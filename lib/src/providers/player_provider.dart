@@ -1,0 +1,72 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+
+import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/core/audio/volume_fade.dart';
+import 'package:jplayer/src/data/providers/shared_preferences_provider.dart';
+import 'package:jplayer/src/domain/providers/app_settings_provider.dart';
+import 'package:jplayer/src/providers/audio_handler.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+
+var _audioServiceInitialized = false;
+
+final playerProvider = Provider<AudioPlayer>((ref) {
+  final player = AudioPlayer(
+    audioLoadConfiguration: const AudioLoadConfiguration(
+      darwinLoadControl: DarwinLoadControl(
+        preferredForwardBufferDuration: Duration(minutes: 30),
+      ),
+      androidLoadControl: AndroidLoadControl(
+        minBufferDuration: Duration(minutes: 6),
+        maxBufferDuration: Duration(minutes: 10),
+        targetBufferBytes: 96 * 1024 * 1024,
+        backBufferDuration: Duration(minutes: 2),
+      ),
+    ),
+  );
+  // On iOS/Android the media notification is handled by just_audio_background
+  // (initialised in main.dart). On desktop — notably Linux, for MPRIS media
+  // keys — we init audio_service with our own handler instead. Running both on
+  // mobile makes this second init override just_audio_background, which breaks
+  // the notification icon (falls back to the opaque launcher icon).
+  final isMobile = Platform.isIOS || Platform.isAndroid;
+  if (isMobile) {
+    JustAudioBackground.playHandler = () => VolumeFade.of(player).play();
+    ref.onDispose(() => JustAudioBackground.playHandler = null);
+  }
+  if (!isMobile && !_audioServiceInitialized) {
+    _audioServiceInitialized = true;
+    AudioService.init(
+      builder: () => JellyBoxAudioHandler(player),
+      config: const AudioServiceConfig(
+        androidNotificationChannelId: 'com.ryanheise.bg_demo.channel.audio',
+        androidNotificationChannelName: 'Audio playback',
+      ),
+    );
+  }
+  unawaited(rememberRepeatMode(ref, player));
+  return player;
+});
+
+@visibleForTesting
+Future<void> rememberRepeatMode(Ref ref, AudioPlayer player) async {
+  StreamSubscription<LoopMode>? changes;
+  ref.onDispose(() => changes?.cancel());
+  final prefs = await ref.read(sharedPreferencesProvider.future);
+  final saved =
+      LoopMode.values.asNameMap()[AppSettingsNotifier.valueIn(
+        prefs,
+        AppSetting.repeatMode,
+      )];
+  if (saved != null && saved != player.loopMode) {
+    await player.setLoopMode(saved);
+  }
+  changes = player.loopModeStream.distinct().listen((mode) {
+    ref
+        .read(appSettingsProvider.notifier)
+        .setValue(AppSetting.repeatMode, mode.name);
+  });
+}

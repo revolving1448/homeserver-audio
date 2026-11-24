@@ -1,0 +1,283 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+import 'package:jplayer/src/config/routes.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/presentation/utils/utils.dart';
+import 'package:jplayer/src/presentation/widgets/widgets.dart';
+
+@visibleForTesting
+class DownloadsPageKeys {
+  @visibleForTesting
+  const DownloadsPageKeys({
+    required this.counterText,
+  });
+
+  final Key counterText;
+}
+
+class DownloadsPage extends StatelessWidget {
+  const DownloadsPage({
+    @visibleForTesting this.testKeys,
+    super.key,
+  });
+
+  final DownloadsPageKeys? testKeys;
+
+  SliverGridDelegate _gridDelegate(DeviceType device) =>
+      SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 200,
+        mainAxisSpacing: device.isMobile ? 15 : 24,
+        crossAxisSpacing: device.isMobile ? 8 : 28,
+        childAspectRatio: 175 / 215.7,
+      );
+
+  void _onAlbumTap(BuildContext context, DownloadedAlbum album) =>
+      context.pushNamed(
+        Routes.album.name,
+        extra: {'album': album.item},
+      );
+
+  void _onPlaylistTap(BuildContext context, DownloadedPlaylist playlist) {
+    final item = playlist.item;
+    switch (EphemeralPlaylistId.parse(item.id)?.kind) {
+      case EphemeralPlaylistKind.likedSongs:
+        context.pushNamed(Routes.homeFavouriteSongs.name);
+      case EphemeralPlaylistKind.onRepeat:
+        context.pushNamed(Routes.homeOnRepeat.name);
+      case EphemeralPlaylistKind.instantMix:
+      case EphemeralPlaylistKind.soundMix:
+      case EphemeralPlaylistKind.genreInstantMix:
+        context.pushNamed(Routes.homeInstantMix.name, extra: {'mix': item});
+      case EphemeralPlaylistKind.genreMix:
+      case EphemeralPlaylistKind.genreDiscovery:
+        context.pushNamed(
+          Routes.homeGeneratedPlaylist.name,
+          extra: {'playlist': item},
+        );
+      case null:
+        context.pushNamed(Routes.playlist.name, extra: {'playlist': item});
+    }
+  }
+
+  Future<void> _play(
+    BuildContext context,
+    LibraryItem item,
+    Future<SetPlaybackResult> Function() start,
+  ) async {
+    try {
+      final result = await start();
+      if (result == SetPlaybackResult.empty && context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Nothing to play in "${item.name}"')),
+        );
+      }
+    } on Object catch (_) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not start playing "${item.name}"')),
+        );
+      }
+    }
+  }
+
+  String _counterLabel(int albumCount, int playlistCount, int songCount) => [
+    Intl.plural(
+      albumCount,
+      one: '$albumCount album',
+      other: '$albumCount albums',
+    ),
+    if (playlistCount > 0)
+      Intl.plural(
+        playlistCount,
+        one: '$playlistCount playlist',
+        other: '$playlistCount playlists',
+      ),
+    if (songCount > 0)
+      Intl.plural(
+        songCount,
+        one: '$songCount song',
+        other: '$songCount songs',
+      ),
+  ].join(' • ');
+
+  Widget _sectionHeader(DeviceType device, String title) => SliverToBoxAdapter(
+    child: Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Text(
+        title,
+        style: TextStyle(
+          fontSize: device.isMobile ? 16 : 22,
+          fontWeight: FontWeight.w600,
+          height: 1.2,
+        ),
+      ),
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final device = DeviceType.fromScreenSize(MediaQuery.sizeOf(context));
+
+    return ScrollablePageScaffold(
+      useGradientBackground: true,
+      navigationBar: PreferredSize(
+        preferredSize: Size.fromHeight(device.isMobile ? 60 : 100),
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: device.isMobile ? 16 : 30),
+          child: Row(
+            children: [
+              Text(
+                'Downloads',
+                style: TextStyle(
+                  fontSize: device.isMobile ? 24 : 36,
+                  fontWeight: FontWeight.w600,
+                  height: 1.2,
+                ),
+              ),
+              SizedBox(width: device.isMobile ? 12 : 24),
+              Flexible(
+                child: Consumer(
+                  builder: (context, ref, child) {
+                    final albumCount =
+                        ref
+                            .watch(downloadedAlbumsProvider)
+                            .valueOrNull
+                            ?.length ??
+                        0;
+                    final playlistCount =
+                        ref
+                            .watch(downloadedPlaylistsProvider)
+                            .valueOrNull
+                            ?.length ??
+                        0;
+                    final songCount =
+                        ref
+                            .watch(standaloneDownloadedSongsProvider)
+                            .valueOrNull
+                            ?.length ??
+                        0;
+                    return Text(
+                      _counterLabel(albumCount, playlistCount, songCount),
+                      key: testKeys?.counterText,
+                      style: TextStyle(
+                        fontSize: device.isMobile ? 12 : 16,
+                        height: 1.2,
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      contentPadding: EdgeInsets.only(
+        left: device.isMobile ? 16 : 30,
+        right: device.isMobile ? 16 : 30,
+        bottom: 30,
+      ),
+      slivers: [
+        Consumer(
+          builder: (context, ref, child) {
+            final albums = ref.watch(downloadedAlbumsProvider);
+            final playlists = ref.watch(downloadedPlaylistsProvider);
+            final songs = ref.watch(standaloneDownloadedSongsProvider);
+
+            if (!albums.hasValue || !playlists.hasValue || !songs.hasValue) {
+              final error = albums.error ?? playlists.error ?? songs.error;
+              if (error != null) {
+                return SliverToBoxAdapter(
+                  child: Center(child: Text('Error: $error')),
+                );
+              }
+              return AlbumCardsGridShimmer(
+                device: device,
+                gridDelegate: _gridDelegate(device),
+              );
+            }
+
+            final albumItems = albums.valueOrNull ?? const [];
+            final playlistItems = playlists.valueOrNull ?? const [];
+            final songItems = [
+              for (final song in songs.valueOrNull ?? const <DownloadedSong>[])
+                song.item,
+            ];
+            final sections = [
+              playlistItems,
+              albumItems,
+              songItems,
+            ].where((items) => items.isNotEmpty).length;
+
+            if (sections == 0) {
+              return const SliverToBoxAdapter(
+                child: Center(child: Text('No downloads yet')),
+              );
+            }
+
+            return SliverMainAxisGroup(
+              slivers: [
+                if (playlistItems.isNotEmpty) ...[
+                  if (sections > 1) _sectionHeader(device, 'Playlists'),
+                  SliverGrid.builder(
+                    gridDelegate: _gridDelegate(device),
+                    itemBuilder: (context, index) => DownloadedPlaylistView(
+                      playlist: playlistItems[index],
+                      onTap: (playlist) => _onPlaylistTap(context, playlist),
+                      onPlayPressed: (playlist) => _play(
+                        context,
+                        playlist.item,
+                        () => ref
+                            .read(setPlaybackProvider.notifier)
+                            .playPlaylist(playlist.item),
+                      ),
+                      onDelete: (playlist) => ref
+                          .read(downloadManagerProvider)
+                          .deletePlaylist(playlist.item.id),
+                    ),
+                    itemCount: playlistItems.length,
+                  ),
+                ],
+                if (albumItems.isNotEmpty) ...[
+                  if (sections > 1) _sectionHeader(device, 'Albums'),
+                  SliverGrid.builder(
+                    gridDelegate: _gridDelegate(device),
+                    itemBuilder: (context, index) => DownloadedAlbumView(
+                      album: albumItems[index],
+                      onTap: (album) => _onAlbumTap(context, album),
+                      onPlayPressed: (album) => _play(
+                        context,
+                        album.item,
+                        () => ref
+                            .read(setPlaybackProvider.notifier)
+                            .playAlbum(album.item),
+                      ),
+                      onDelete: (album) => ref
+                          .read(downloadManagerProvider)
+                          .deleteAlbum(album.item.id),
+                    ),
+                    itemCount: albumItems.length,
+                  ),
+                ],
+                if (songItems.isNotEmpty) ...[
+                  if (sections > 1)
+                    SliverPadding(
+                      padding: const EdgeInsets.only(top: 24),
+                      sliver: _sectionHeader(device, 'Songs'),
+                    ),
+                  SongListSliver(
+                    songs: songItems,
+                    edgePadding: 0,
+                    onItemUpdated: (_) {},
+                  ),
+                ],
+              ],
+            );
+          },
+        ),
+      ],
+    );
+  }
+}

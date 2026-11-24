@@ -1,0 +1,110 @@
+import 'package:jplayer/src/data/dto/dto.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+
+extension ItemDTOMapping on ItemDTO {
+  LibraryItem toLibraryItem() {
+    return LibraryItem(
+      id: id,
+      name: name,
+      kind: _kindFromType(type),
+      indexNumber: indexNumber,
+      discNumber: parentIndexNumber,
+      duration: duration,
+      path: path,
+      collectionType: collectionType,
+      playlistItemId: playlistItemId,
+      overview: overview,
+      productionYear: productionYear,
+      originalReleaseDate: mediaBrowserReleaseDate(premiereDate),
+      albumId: albumId,
+      albumName: albumName,
+      albumArtist: albumArtist,
+      albumArtists: albumArtists
+          .map((artist) => ArtistRef(id: artist.id, name: artist.name))
+          .toList(),
+      artists: artists
+          .map((artist) => ArtistRef(id: artist.id, name: artist.name))
+          .toList(),
+      genres: genres,
+      images: ImageRefs(
+        primary: imageTags['Primary'],
+        albumPrimary: albumPrimaryImageTag,
+        backdrops: backdropImageTags,
+      ),
+      hasLyrics: hasLyrics,
+      userData: PlaybackUserData(
+        position: Duration(
+          milliseconds: (userData.playbackPositionTicks / 10000).round(),
+        ),
+        playCount: userData.playCount,
+        isFavorite: userData.isFavorite,
+        played: userData.played,
+      ),
+      audioSources: [
+        for (final source in mediaSources) _toAudioSourceInfo(source),
+      ],
+      externalIds: {
+        for (final entry in providerIds.entries)
+          if (entry.value case final String value when value.trim().isNotEmpty)
+            entry.key: value.trim(),
+      },
+    );
+  }
+}
+
+AudioSourceInfo _toAudioSourceInfo(MediaSourceDTO source) {
+  final audioStream = source.mediaStreams
+      .where((stream) => stream.type == 'Audio')
+      .firstOrNull;
+  return AudioSourceInfo(
+    id: source.id,
+    container: source.container,
+    url: _remoteUrl(source.path),
+    codec: audioStream?.codec,
+    bitRate: audioStream?.bitRate,
+    sampleRate: audioStream?.sampleRate,
+    bitDepth: audioStream?.bitDepth,
+    channels: audioStream?.channels,
+    channelLayout: audioStream?.channelLayout,
+  );
+}
+
+String? _remoteUrl(String? path) =>
+    path != null && (path.startsWith('http://') || path.startsWith('https://'))
+    ? path
+    : null;
+
+extension ItemsWrapperMapping on ItemsWrapper {
+  LibraryPage toLibraryPage() => LibraryPage(
+    items: items.map((item) => item.toLibraryItem()).toList(),
+    totalRecordCount: totalRecordCount,
+  );
+}
+
+ItemKind _kindFromType(String type) {
+  switch (type) {
+    case 'Audio':
+      return ItemKind.song;
+    case 'MusicAlbum':
+      return ItemKind.album;
+    case 'Artist':
+    case 'MusicArtist':
+      return ItemKind.artist;
+    case 'Playlist':
+      return ItemKind.playlist;
+    case 'MusicGenre':
+      return ItemKind.genre;
+    case 'CollectionFolder':
+    case 'Library':
+      return ItemKind.library;
+    default:
+      return ItemKind.unknown;
+  }
+}
+
+DateTime? mediaBrowserReleaseDate(String? premiereDate) {
+  if (premiereDate == null) return null;
+  final parsed = DateTime.tryParse(premiereDate)?.toUtc();
+  if (parsed == null) return null;
+  return DateTime(parsed.year, parsed.month, parsed.day);
+}

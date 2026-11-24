@@ -1,0 +1,263 @@
+import 'dart:async';
+import 'dart:io' show HttpOverrides, Platform;
+import 'dart:math' show max;
+
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'package:audio_session/audio_session.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_udid/flutter_udid.dart';
+import 'package:jplayer/src/app.dart';
+import 'package:jplayer/src/core/android_auto/android_auto_handler.dart';
+import 'package:jplayer/src/core/car/car_content.dart';
+import 'package:jplayer/src/core/carplay/carplay_handler.dart';
+import 'package:jplayer/src/core/cast/cast_runtime.dart';
+import 'package:jplayer/src/core/diagnostics/device_log.dart';
+import 'package:jplayer/src/core/discord/discord_presence_handler.dart';
+import 'package:jplayer/src/core/home_widget/now_playing_widget_sync.dart';
+import 'package:jplayer/src/core/home_widget/widget_commands.dart';
+import 'package:jplayer/src/core/lastfm/lastfm_scrobbler.dart';
+import 'package:jplayer/src/core/listenbrainz/listenbrainz_scrobbler.dart';
+import 'package:jplayer/src/core/remote_output/remote_output_session.dart';
+import 'package:jplayer/src/core/scrobbling/play_history_scrobbler.dart';
+import 'package:jplayer/src/core/scrobbling/scrobble_handler.dart';
+import 'package:jplayer/src/core/downloads/download_paths.dart';
+import 'package:jplayer/src/core/errors/image_error_filter.dart';
+import 'package:jplayer/src/core/network/certificate_trust.dart';
+import 'package:jplayer/src/core/platform/tv_mode.dart';
+import 'package:jplayer/src/core/smtc/smtc_handler.dart';
+import 'package:jplayer/src/core/telemetry/telemetry.dart';
+import 'package:jplayer/src/data/storages/download_database.dart';
+import 'package:jplayer/src/data/storages/window_placement_storage.dart';
+import 'package:jplayer/src/domain/providers/cloud_provider.dart';
+import 'package:jplayer/src/domain/providers/pending_media_play_provider.dart';
+import 'package:jplayer/src/domain/providers/studio_mode_provider.dart';
+import 'package:screen_retriever/screen_retriever.dart';
+import 'package:jplayer/src/presentation/widgets/landscape_player.dart';
+import 'package:jplayer/src/presentation/tv/tv_screen_factory.dart';
+import 'package:jplayer/src/screen_factory.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:responsive_builder/responsive_builder.dart';
+import 'package:sentry_flutter/sentry_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player_media_kit/video_player_media_kit.dart';
+import 'package:window_manager/window_manager.dart';
+
+late String deviceId;
+late PackageInfo appInfo;
+
+Future<void> main() async {
+  if (Platform.isLinux || Platform.isWindows) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
+
+  SentryWidgetsFlutterBinding.ensureInitialized();
+
+  if (Platform.isLinux || Platform.isWindows) {
+    DownloadDatabase.databaseDirectory =
+        (await getApplicationSupportDirectory()).path;
+  }
+
+  deviceId = (await FlutterUdid.udid).trim();
+  appInfo = await PackageInfo.fromPlatform();
+  await TvMode.init();
+
+  DeviceLog.configure(
+    DeviceLog(
+      directory: Platform.isAndroid
+          ? () async =>
+                await getExternalStorageDirectory() ??
+                await getApplicationSupportDirectory()
+          : getApplicationSupportDirectory,
+      adoptFrom: Platform.isAndroid ? getApplicationSupportDirectory : null,
+    ),
+    header:
+        'JellyBox ${appInfo.version}+${appInfo.buildNumber} starting on '
+        '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+  );
+  DeviceLog.install();
+
+  await DownloadPaths.init();
+
+  ResponsiveSizingConfig.instance.setCustomBreakpoints(
+    const ScreenBreakpoints(desktop: 1025, tablet: 600, watch: 200),
+    customRefinedBreakpoints: const RefinedBreakpoints(),
+  );
+
+  if (locksIdlePhonesToPortrait) {
+    final view = WidgetsBinding.instance.platformDispatcher.implicitView;
+    final size = view == null
+        ? Size.zero
+        : view.physicalSize / view.devicePixelRatio;
+    if (isPhoneSize(size)) {
+      await SystemChrome.setPreferredOrientations(
+        const [DeviceOrientation.portraitUp],
+      );
+    }
+  }
+
+  if (Platform.isIOS || Platform.isAndroid) {
+    await JustAudioBackground.init(
+      androidNotificationChannelId: 'com.ryanheise.bg_demo.channel.audio',
+      androidNotificationChannelName: 'Audio playback',
+      androidStopForegroundOnPause: false,
+      androidNotificationIcon: 'drawable/ic_stat_music',
+      androidBrowsableRootExtras: AndroidAutoHandler.rootExtras,
+    );
+  }
+
+  unawaited(initializeCast());
+
+  if (Platform.isIOS) {
+    final session = await AudioSession.instance;
+    await session.configure(
+      const AudioSessionConfiguration.music().copyWith(
+        avAudioSessionRouteSharingPolicy:
+            AVAudioSessionRouteSharingPolicy.longFormAudio,
+      ),
+    );
+  }
+
+  final prefs = await SharedPreferences.getInstance();
+  await CertificateTrust.instance.load(prefs);
+  HttpOverrides.global = TrustedCertificateHttpOverrides(
+    CertificateTrust.instance,
+  );
+
+  final container = ProviderContainer(
+    overrides: [
+      if (Platform.isIOS || Platform.isAndroid)
+        pendingMediaPlayProvider.overrideWithValue(
+          JustAudioBackground.takePendingPlay,
+        ),
+    ],
+  );
+  Telemetry.watch(container);
+  final carContent = CarContent(container);
+  const personalBuild = bool.fromEnvironment('HOMESERVER_PERSONAL', defaultValue: true);
+  if (Platform.isIOS && !personalBuild) CarPlayHandler.initialize(container, carContent);
+  if (Platform.isAndroid) AndroidAutoHandler.initialize(container, carContent);
+  RemoteOutputSession.initialize(container);
+  if (!personalBuild) {
+    NowPlayingWidgetSync.initialize(container);
+    WidgetCommands.initialize(container, carContent);
+  }
+
+  final placement = WindowPlacementStorage(prefs);
+  final lastWindowSize = await placement.getWindowSize();
+  final lastWindowPosition = await placement.getWindowPosition();
+
+  // Window settings
+  final savedOrDefaultSize = lastWindowSize ?? const Size(1440, 1000);
+  final initialWindowSize = Size(
+    max(savedOrDefaultSize.width, minWindowSize.width),
+    max(savedOrDefaultSize.height, minWindowSize.height),
+  );
+
+  if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) {
+    await windowManager.ensureInitialized();
+
+    final isWayland =
+        Platform.isLinux &&
+        (Platform.environment['XDG_SESSION_TYPE']?.toLowerCase() == 'wayland' ||
+            Platform.environment['WAYLAND_DISPLAY'] != null);
+
+    final restoredPosition = isWayland
+        ? null
+        : await _restorableWindowPosition(lastWindowPosition);
+
+    final windowOptions = WindowOptions(
+      size: initialWindowSize,
+      minimumSize: minWindowSize,
+      center: restoredPosition == null,
+      backgroundColor: Colors.transparent,
+      skipTaskbar: false,
+      titleBarStyle: TitleBarStyle.hidden,
+    );
+
+    if (isWayland) {
+      await windowManager.setOpacity(0);
+      await windowManager.show();
+    }
+
+    await windowManager.waitUntilReadyToShow(
+      windowOptions,
+      () async {
+        if (restoredPosition != null) {
+          await windowManager.setPosition(restoredPosition);
+        }
+        if (isWayland) await windowManager.setOpacity(1);
+        await windowManager.show();
+        await windowManager.focus();
+      },
+    );
+  }
+
+  if (Platform.isLinux || Platform.isWindows) {
+    JustAudioMediaKit.ensureInitialized();
+    VideoPlayerMediaKit.ensureInitialized(windows: true, linux: true);
+  }
+
+  if (Platform.isWindows) await SmtcHandler.initialize(container);
+
+  container.read(cloudProvider.notifier);
+
+  DiscordPresenceHandler.initialize(container);
+  ScrobbleHandler.initialize(
+    container,
+    scrobblers: [
+      ListenBrainzScrobbler(container, clientVersion: appInfo.version),
+      LastFmScrobbler(container),
+      PlayHistoryScrobbler(container),
+    ],
+  );
+
+  await Telemetry.start(
+    optedOut: Telemetry.optedOutIn(prefs),
+    appRunner: () => runApp(
+      UncontrolledProviderScope(
+        container: container,
+        child: App(
+          screenFactory: TvMode.isTv
+              ? const TvScreenFactory()
+              : const ScreenFactory(),
+        ),
+      ),
+    ),
+  );
+
+  _silenceUnreachableImageErrors();
+}
+
+void _silenceUnreachableImageErrors() {
+  final reportError = FlutterError.onError;
+  FlutterError.onError = (details) {
+    if (isUnreachableImageFailure(details)) {
+      debugPrint('[Images] unreachable: ${details.exception}');
+      return;
+    }
+    reportError?.call(details);
+  };
+}
+
+Future<Offset?> _restorableWindowPosition(Offset? saved) async {
+  if (saved == null) return null;
+  try {
+    final displays = await screenRetriever.getAllDisplays();
+    final grabHandle = saved + const Offset(80, 16);
+    for (final display in displays) {
+      final origin = display.visiblePosition ?? Offset.zero;
+      final area = display.visibleSize ?? display.size;
+      if ((origin & area).contains(grabHandle)) return saved;
+    }
+  } on Object catch (error) {
+    debugPrint('[Window] checking the saved position failed: $error');
+  }
+  return null;
+}

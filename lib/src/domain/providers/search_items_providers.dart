@@ -1,0 +1,88 @@
+import 'dart:async';
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/core/exceptions/exceptions.dart';
+import 'package:jplayer/src/data/backend/library_query.dart';
+import 'package:jplayer/src/data/backend/media_server_client.dart';
+import 'package:jplayer/src/data/providers/providers.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/providers/connectivity_provider.dart';
+
+class SearchItemsNotifier
+    extends AutoDisposeFamilyAsyncNotifier<ItemsPage, ItemList> {
+  late MediaServerClient _client;
+  late ArtistScope _artistScope;
+  var _searchTerm = '';
+
+  @override
+  FutureOr<ItemsPage> build(ItemList arg) async {
+    if (ref.watch(isOfflineProvider)) throw const OfflineException();
+    _client = ref.watch(mediaServerClientProvider);
+    _artistScope = ref.watch(effectiveArtistScopeProvider);
+
+    final searchQuery = ref.watch(searchProvider)?.trim();
+
+    if (searchQuery == _searchTerm) {
+      return state.valueOrNull ?? const ItemsPage();
+    }
+
+    _searchTerm = searchQuery ?? '';
+    if (_searchTerm.isEmpty) return const ItemsPage();
+
+    final libraryId = ref.read(currentLibraryProvider).valueOrNull?.id;
+
+    switch (arg) {
+      case ItemList.songs:
+        final resp = await _client.searchSongs(
+          SearchQuery(term: _searchTerm, libraryId: libraryId),
+        );
+        return ItemsPage(items: resp.items);
+      case ItemList.artists:
+        final resp = await _client.searchArtists(
+          SearchQuery(
+            term: _searchTerm,
+            libraryId: libraryId,
+            artistScope: _artistScope,
+          ),
+        );
+        return ItemsPage(items: resp.items);
+      case ItemList.playlists:
+        if (!ref.read(serverCapabilitiesProvider).playlistSearch) {
+          return const ItemsPage();
+        }
+        final resp = await _client.searchPlaylists(
+          SearchQuery(term: _searchTerm, libraryId: libraryId),
+        );
+        return ItemsPage(items: resp.items);
+      default:
+        final resp = await _client.searchAlbums(
+          SearchQuery(term: _searchTerm, libraryId: libraryId),
+        );
+        return ItemsPage(items: resp.items);
+    }
+  }
+
+  void updateItem(LibraryItem updated) {
+    final current = state.valueOrNull;
+    if (current == null) return;
+    state = AsyncData(
+      current.copyWith(
+        items: [
+          for (final item in current.items)
+            if (item.id == updated.id) updated else item,
+        ],
+      ),
+    );
+  }
+}
+
+final searchItemsProvider =
+    AutoDisposeAsyncNotifierProviderFamily<
+      SearchItemsNotifier,
+      ItemsPage,
+      ItemList
+    >(
+      SearchItemsNotifier.new,
+    );

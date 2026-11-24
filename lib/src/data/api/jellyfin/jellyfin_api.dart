@@ -1,0 +1,381 @@
+import 'package:dio/dio.dart';
+import 'package:jplayer/src/data/dto/dto.dart';
+import 'package:jplayer/src/data/params/params.dart';
+import 'package:retrofit/retrofit.dart';
+
+part 'jellyfin_api.g.dart';
+
+@RestApi(parser: Parser.JsonSerializable)
+abstract class JellyfinApi {
+  factory JellyfinApi(
+    Dio client, {
+    String baseUrl,
+  }) = _JellyfinApi;
+
+  @GET('/System/Info/Public')
+  Future<HttpResponse<PublicSystemInfoDTO>> getPublicSystemInfo();
+
+  @POST('/Users/AuthenticateByName')
+  Future<HttpResponse<SignInResultDTO>> signIn({
+    @Body() required UserCredentials credentials,
+  });
+
+  @GET('/QuickConnect/Enabled')
+  Future<HttpResponse<bool>> quickConnectEnabled();
+
+  @POST('/QuickConnect/Initiate')
+  Future<HttpResponse<QuickConnectStateDTO>> initiateQuickConnect();
+
+  @GET('/QuickConnect/Connect')
+  Future<HttpResponse<QuickConnectStateDTO>> quickConnectState({
+    @Query('secret') required String secret,
+  });
+
+  @POST('/Users/AuthenticateWithQuickConnect')
+  Future<HttpResponse<SignInResultDTO>> signInWithQuickConnect({
+    @Body() required QuickConnectSecret secret,
+  });
+
+  @POST('/Users/{userId}/FavoriteItems/{itemId}')
+  Future<HttpResponse<void>> saveFavorite({
+    @Path('userId') required String userId,
+    @Path('itemId') required String itemId,
+  });
+
+  @DELETE('/Users/{userId}/FavoriteItems/{itemId}')
+  Future<HttpResponse<void>> removeFavorite({
+    @Path('userId') required String userId,
+    @Path('itemId') required String itemId,
+  });
+
+  @POST('/UserItems/{itemId}/UserData')
+  Future<HttpResponse<void>> updateUserData({
+    @Path('itemId') required String itemId,
+    @Query('userId') required String userId,
+    @Body() required Map<String, dynamic> userData,
+  });
+
+  @DELETE('/UserItems/{itemId}/Rating')
+  Future<HttpResponse<void>> deleteRating({
+    @Path('itemId') required String itemId,
+    @Query('userId') required String userId,
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getSongs({
+    @Path('userId') required String userId,
+    @Query('ParentId') required String albumId,
+    @Query('IncludeItemTypes') String includeType = 'music',
+    @Query('Fields')
+    List<String> fields = const ['MediaSources', 'ArtistItems', 'ProviderIds'],
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getItemsByIds({
+    @Path('userId') required String userId,
+    @Query('Ids') required String ids,
+    @Query('Fields') List<String> fields = const ['MediaSources'],
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getAllSongs({
+    @Path('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('IncludeItemTypes') String type = 'Audio',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortBy') String sortBy = 'SortName',
+    @Query('SortOrder') String sortOrder = 'Ascending',
+    @Query('Filters') List<String> filters = const [],
+    @Query('Recursive') bool recursive = true,
+    @Query('Fields')
+    List<String> fields = const ['MediaSources', 'ArtistItems', 'ProviderIds'],
+    @Query('NameLessThan') String? nameLessThan,
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getSongsOfSet({
+    @Path('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('AlbumArtistIds') List<String> artistIds = const [],
+    @Query('GenreIds') List<String> genreIds = const [],
+    @Query('Filters') List<String> filters = const [],
+    @Query('IncludeItemTypes') String type = 'Audio',
+    @Query('SortBy')
+    String sortBy = 'AlbumArtist,Album,ParentIndexNumber,IndexNumber',
+    @Query('SortOrder') String sortOrder = 'Ascending',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '300',
+    @Query('Recursive') bool recursive = true,
+    @Query('Fields')
+    List<String> fields = const ['MediaSources', 'ArtistItems', 'ProviderIds'],
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getAlbums({
+    @Path('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('IncludeItemTypes') String type = 'MusicAlbum',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortBy') String sortBy = 'DateCreated,SortName',
+    @Query('ContributingArtistIds') String? contributingArtistIds,
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('AlbumArtistIds') List<String> artistIds = const [],
+    @Query('GenreIds') List<String> genreIds = const [],
+    @Query('Filters') List<String> filters = const [],
+    @Query('Ids') List<String> ids = const [],
+    @Query('Recursive') bool recursive = true,
+    @Query('Fields') List<String> fields = const ['ProviderIds'],
+    @Query('NameLessThan') String? nameLessThan,
+  });
+
+  @GET('/Users/{userId}/Items/Latest')
+  Future<HttpResponse<List<ItemDTO>>> getLatestItems({
+    @Path('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('IncludeItemTypes') String type = 'Audio',
+    @Query('GroupItems') bool groupItems = true,
+    @Query('Limit') String limit = '20',
+    @Query('Fields') List<String> fields = const ['ProviderIds'],
+  });
+
+  @GET('/Albums/{albumId}/Similar')
+  Future<HttpResponse<ItemsWrapper>> getSimilarAlbums({
+    @Path('albumId') required String albumId,
+    @Query('userId') required String userId,
+    @Query('Limit') String limit = '12',
+    @Query('Fields') List<String> fields = const ['ProviderIds'],
+  });
+
+  @GET('/Items/{itemId}/InstantMix')
+  Future<HttpResponse<ItemsWrapper>> getInstantMix({
+    @Path('itemId') required String itemId,
+    @Query('userId') required String userId,
+    @Query('Limit') String limit = '100',
+    @Query('Fields')
+    List<String> fields = const ['MediaSources', 'ProviderIds'],
+    @Query('EnableUserData') bool enableUserData = true,
+    @Query('EnableImages') bool enableImages = true,
+    @Query('EnableImageTypes')
+    List<String> enableImageTypes = const ['Primary'],
+  });
+
+  @GET('/MusicGenres')
+  Future<HttpResponse<ItemsWrapper>> getGenres({
+    @Query('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortBy') String sortBy = 'SortName',
+    @Query('SortOrder') String sortOrder = 'Ascending',
+    @Query('Recursive') bool recursive = true,
+    @Query('NameLessThan') String? nameLessThan,
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> searchSongs({
+    @Path('userId') required String userId,
+    @Query('searchTerm') required String searchTerm,
+    @Query('ParentId') String? libraryId,
+    @Query('IncludeItemTypes') String type = 'Audio',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+    @Query('Fields')
+    List<String> fields = const ['MediaSources', 'ArtistItems', 'ProviderIds'],
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> searchAlbums({
+    @Path('userId') required String userId,
+    @Query('searchTerm') required String searchTerm,
+    @Query('ParentId') String? libraryId,
+    @Query('IncludeItemTypes') String type = 'MusicAlbum',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+    @Query('Fields') List<String> fields = const ['ProviderIds'],
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getPlaylists({
+    @Path('userId') required String userId,
+    @Query('IncludeItemTypes') String type = 'Playlist',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortBy') String sortBy = 'DateCreated,SortName',
+    @Query('ContributingArtistIds') String? contributingArtistIds,
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('AlbumArtistIds') List<String> artistIds = const [],
+    @Query('Recursive') bool recursive = true,
+    @Query('Filters') List<String> filters = const [],
+    @Query('NameLessThan') String? nameLessThan,
+  });
+
+  @GET('/Users/{userId}/Items')
+  Future<HttpResponse<ItemsWrapper>> searchPlaylists({
+    @Path('userId') required String userId,
+    @Query('ParentId') required String libraryId,
+    @Query('searchTerm') required String searchTerm,
+    @Query('IncludeItemTypes') String type = 'Playlist',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+  });
+
+  @GET('/Playlists/{playlistId}/Items')
+  Future<HttpResponse<ItemsWrapper>> getPlaylistSongs({
+    @Path('playlistId') required String playlistId,
+    @Query('userId') required String userId,
+    @Query('IncludeItemTypes') String includeType = 'music',
+    @Query('Fields')
+    List<String> fields = const ['MediaSources', 'ArtistItems', 'ProviderIds'],
+  });
+
+  @GET('/Items/{itemId}')
+  Future<HttpResponse<ItemDTO>> getItem({
+    @Path('itemId') required String itemId,
+    @Query('Fields')
+    List<String> fields = const [
+      'MediaSources',
+      'ArtistItems',
+      'ProviderIds',
+      'Overview',
+    ],
+  });
+
+  @GET('/Audio/{itemId}/Lyrics')
+  Future<HttpResponse<LyricsDTO>> getLyrics({
+    @Path('itemId') required String itemId,
+  });
+
+  @POST('/Playlists')
+  Future<HttpResponse<void>> createPlaylist({
+    @Body() required PlaylistData values,
+  });
+
+  @DELETE('/Items/{playlistId}')
+  Future<HttpResponse<void>> deletePlaylist({
+    @Path('playlistId') required String playlistId,
+  });
+
+  @POST('/Playlists/{playlistId}/Items')
+  Future<HttpResponse<void>> addPlaylistItems({
+    @Path('playlistId') required String playlistId,
+    @Query('userId') required String userId,
+    @Query('ids') required String entryIds,
+  });
+
+  @DELETE('/Playlists/{playlistId}/Items')
+  Future<HttpResponse<void>> removePlaylistItem({
+    @Path('playlistId') required String playlistId,
+    @Query('EntryIds') required String entryIds,
+  });
+
+  @GET('/Artists')
+  Future<HttpResponse<ItemsWrapper>> getArtists({
+    @Query('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('Fields')
+    List<String> fields = const [
+      'BackdropImageTags',
+      'Overview',
+      'ProviderIds',
+    ],
+    @Query('IncludeArtists') bool includeArtists = true,
+    @Query('IncludeItemTypes') String type = 'Artist',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortBy') String sortBy = 'SortName',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+    @Query('Filters') List<String> filters = const [],
+    @Query('NameLessThan') String? nameLessThan,
+  });
+
+  @GET('/Artists/AlbumArtists')
+  Future<HttpResponse<ItemsWrapper>> getAlbumArtists({
+    @Query('userId') required String userId,
+    @Query('ParentId') String? libraryId,
+    @Query('Fields')
+    List<String> fields = const [
+      'BackdropImageTags',
+      'Overview',
+      'ProviderIds',
+    ],
+    @Query('IncludeArtists') bool includeArtists = true,
+    @Query('IncludeItemTypes') String type = 'Artist',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortBy') String sortBy = 'SortName',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+    @Query('Filters') List<String> filters = const [],
+    @Query('NameLessThan') String? nameLessThan,
+  });
+
+  @GET('/Artists')
+  Future<HttpResponse<ItemsWrapper>> searchArtists({
+    @Query('userId') required String userId,
+    @Query('searchTerm') required String searchTerm,
+    @Query('ParentId') String? libraryId,
+    @Query('Fields')
+    List<String> fields = const [
+      'BackdropImageTags',
+      'Overview',
+      'ProviderIds',
+    ],
+    @Query('IncludeArtists') bool includeArtists = true,
+    @Query('IncludeItemTypes') String type = 'Artist',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+  });
+
+  @GET('/Artists/AlbumArtists')
+  Future<HttpResponse<ItemsWrapper>> searchAlbumArtists({
+    @Query('userId') required String userId,
+    @Query('searchTerm') required String searchTerm,
+    @Query('ParentId') String? libraryId,
+    @Query('Fields')
+    List<String> fields = const [
+      'BackdropImageTags',
+      'Overview',
+      'ProviderIds',
+    ],
+    @Query('IncludeArtists') bool includeArtists = true,
+    @Query('IncludeItemTypes') String type = 'Artist',
+    @Query('StartIndex') String startIndex = '0',
+    @Query('Limit') String limit = '100',
+    @Query('SortOrder') String sortOrder = 'Descending',
+    @Query('Recursive') bool recursive = true,
+  });
+
+  @GET('/Users/{userId}/Views')
+  Future<HttpResponse<ItemsWrapper>> getLibraries({
+    @Path('userId') required String userId,
+  });
+
+  @POST('/Sessions/Playing')
+  Future<HttpResponse<void>> playbackStarted({
+    @Body() required PlaystateData values,
+  });
+
+  @POST('/Sessions/Playing/Progress')
+  Future<HttpResponse<void>> playbackProgress({
+    @Body() required PlaystateData values,
+  });
+
+  @POST('/Sessions/Playing/Stopped')
+  Future<HttpResponse<void>> playbackStopped({
+    @Body() required PlaystateData values,
+  });
+
+  @POST('/Sessions/Logout')
+  Future<HttpResponse<void>> signOut();
+}

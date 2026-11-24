@@ -1,0 +1,304 @@
+import 'dart:ui' show ImageFilter;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/player_bar_provider.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/presentation/utils/utils.dart';
+import 'package:jplayer/src/presentation/widgets/context_menu.dart';
+import 'package:jplayer/src/presentation/widgets/rating_stars.dart';
+import 'package:jplayer/src/presentation/widgets/song_row_view.dart';
+
+const _dragBlur = 8.0;
+const _dividerHeight = 28.0;
+
+class NowPlayingQueueView extends ConsumerStatefulWidget {
+  const NowPlayingQueueView({
+    this.padding = EdgeInsets.zero,
+    this.isActive = true,
+    super.key,
+  });
+
+  final EdgeInsets padding;
+
+  final bool isActive;
+
+  @override
+  ConsumerState<NowPlayingQueueView> createState() =>
+      _NowPlayingQueueViewState();
+}
+
+class _NowPlayingQueueViewState extends ConsumerState<NowPlayingQueueView> {
+  final _scrollController = ScrollController();
+  var _itemExtent = 62.0;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isActive) _revealCurrentSongOnNextFrame();
+  }
+
+  @override
+  void didUpdateWidget(NowPlayingQueueView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.isActive && !oldWidget.isActive) {
+      _revealCurrentSongOnNextFrame();
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _itemExtent =
+        DeviceType.fromScreenSize(
+          MediaQuery.sizeOf(context),
+        ).isMobile
+        ? 62.0
+        : 72.0;
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _revealCurrentSongOnNextFrame() =>
+      WidgetsBinding.instance.addPostFrameCallback((_) => _revealCurrentSong());
+
+  void _revealCurrentSong() {
+    if (!mounted || !_scrollController.hasClients) return;
+    final position = ref.read(barQueueIndexProvider) ?? 0;
+    final divider = infinitePlayStart(
+      ref.read(barQueueProvider),
+      ref.read(infinitePlayProvider),
+    );
+    final scroll = _scrollController.position;
+    final centered =
+        (position < 0 ? 0 : position) * _itemExtent +
+        (divider != null && position >= divider ? _dividerHeight : 0) -
+        (scroll.viewportDimension - _itemExtent) / 2;
+
+    _scrollController.jumpTo(centered.clamp(0.0, scroll.maxScrollExtent));
+  }
+
+  Future<void> _toggleFavourite(LibraryItem song) async {
+    final saved = await ref.read(barControlsProvider).toggleFavourite(song);
+    if (!saved) _showOfflineNotice();
+  }
+
+  Future<void> _rate(LibraryItem song, int rating) async {
+    final saved = await ref.read(barControlsProvider).rate(song, rating);
+    if (saved) return;
+    _showOfflineNotice();
+    throw StateError('Rating not saved');
+  }
+
+  void _showOfflineNotice() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('This action needs a connection')),
+    );
+  }
+
+  List<Key> _itemKeys(List<LibraryItem> songs) {
+    final seen = <String, int>{};
+    return [
+      for (final song in songs)
+        ValueKey(
+          '${song.id}#'
+          '${seen.update(song.id, (count) => count + 1, ifAbsent: () => 0)}',
+        ),
+    ];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final songs = ref.watch(barQueueProvider);
+    final currentIndex = ref.watch(barQueueIndexProvider);
+    final divider = infinitePlayStart(songs, ref.watch(infinitePlayProvider));
+
+    final keys = _itemKeys(songs);
+    final isDesktop = DeviceType.fromScreenSize(
+      MediaQuery.sizeOf(context),
+    ).isDesktop;
+
+    return ReorderableListView.builder(
+      scrollController: _scrollController,
+      padding: widget.padding,
+      itemExtentBuilder: (index, _) =>
+          index == divider ? _itemExtent + _dividerHeight : _itemExtent,
+      buildDefaultDragHandles: false,
+      proxyDecorator: (child, index, animation) => AnimatedBuilder(
+        animation: animation,
+        builder: (context, dragged) {
+          final lift = Curves.easeOut.transform(animation.value);
+          return Transform.scale(
+            scale: 1 + 0.04 * lift,
+            child: lift < 0.01
+                ? dragged
+                : ClipRect(
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(
+                        sigmaX: _dragBlur * lift,
+                        sigmaY: _dragBlur * lift,
+                      ),
+                      child: dragged,
+                    ),
+                  ),
+          );
+        },
+        child: child,
+      ),
+      onReorder: (from, to) {
+        ref
+            .read(playbackProvider.notifier)
+            .moveInQueue(from, to > from ? to - 1 : to);
+      },
+      itemCount: songs.length,
+      itemBuilder: (context, index) {
+        final song = songs[index];
+        final row = _QueueRow(
+          key: index == divider ? null : keys[index],
+          song: song,
+          position: index,
+          isPlaying: index == currentIndex,
+          isDesktop: isDesktop,
+          onTap: () => ref.read(barControlsProvider).skipTo(index),
+          onLikePressed: () => _toggleFavourite(song),
+          onRatingChanged: (rating) => _rate(song, rating),
+          onRemove: () =>
+              ref.read(playbackProvider.notifier).removeFromQueue(index),
+        );
+        if (index != divider) return row;
+        return Column(
+          key: keys[index],
+          children: [
+            const _InfinitePlayDivider(),
+            SizedBox(height: _itemExtent, child: row),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _InfinitePlayDivider extends StatelessWidget {
+  const _InfinitePlayDivider();
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(
+      context,
+    ).colorScheme.onPrimary.withValues(alpha: 0.5);
+    final line = Expanded(child: Divider(color: color.withValues(alpha: 0.25)));
+    return SizedBox(
+      height: _dividerHeight,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Row(
+          children: [
+            line,
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.all_inclusive, size: 14, color: color),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Infinite playback',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: color,
+                      letterSpacing: 0.4,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            line,
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QueueRow extends ConsumerStatefulWidget {
+  const _QueueRow({
+    required this.song,
+    required this.position,
+    required this.isPlaying,
+    required this.isDesktop,
+    required this.onTap,
+    required this.onLikePressed,
+    required this.onRatingChanged,
+    required this.onRemove,
+    super.key,
+  });
+
+  final LibraryItem song;
+  final int position;
+  final bool isPlaying;
+  final bool isDesktop;
+  final VoidCallback onTap;
+  final VoidCallback onLikePressed;
+  final RatingChanged onRatingChanged;
+  final Future<void> Function() onRemove;
+
+  @override
+  ConsumerState<_QueueRow> createState() => _QueueRowState();
+}
+
+class _QueueRowState extends ConsumerState<_QueueRow> {
+  @override
+  Widget build(BuildContext context) {
+    final row = SongRowView(
+      song: widget.song,
+      isPlaying: widget.isPlaying,
+      secondaryTextColor: Colors.white,
+      edgePadding: 16,
+      onTap: (_) => widget.onTap(),
+      onLikePressed: (_) => widget.onLikePressed(),
+      onRatingChanged: (_, rating) => widget.onRatingChanged(rating),
+      trailing: widget.isDesktop ? null : _optionsButton(),
+    );
+
+    return GestureDetector(
+      onSecondaryTapUp: (details) => showContextMenu(
+        context,
+        position: details.globalPosition,
+        actions: _menuActions(context),
+      ),
+      child: widget.isDesktop
+          ? ReorderableDragStartListener(
+              index: widget.position,
+              child: row,
+            )
+          : ReorderableDelayedDragStartListener(
+              index: widget.position,
+              child: row,
+            ),
+    );
+  }
+
+  List<ContextMenuAction> _menuActions(BuildContext context) => [
+    ContextMenuAction(
+      entry: ContextMenuEntry.removeFromQueue,
+      icon: const Icon(Icons.remove_circle_outline),
+      label: const Text('Remove from queue'),
+      run: widget.onRemove,
+    ),
+    ...contextMenuActions(
+      context,
+      ref,
+      widget.song,
+      scope: ContextMenuScope.queue,
+      onLike: (_) async => widget.onLikePressed(),
+    ),
+  ];
+
+  Widget _optionsButton() => ContextMenuButton(actionsBuilder: _menuActions);
+}

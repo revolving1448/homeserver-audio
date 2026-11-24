@@ -1,0 +1,35 @@
+part of 'resources.dart';
+
+class DbMigrations {
+  DbMigrations._();
+
+  static const String albums = 'assets/db/migrations/albums.sql';
+  static const String downloads = 'assets/db/migrations/downloads.sql';
+  static const String albumsV2 = 'assets/db/migrations/albums_v2.sql';
+  static const String downloadsV2 = 'assets/db/migrations/downloads_v2.sql';
+  static const String albumsV4 = 'assets/db/migrations/albums_v4.sql';
+  static const String downloadsV4 = 'assets/db/migrations/downloads_v4.sql';
+  static const String playlistsV5 = 'assets/db/migrations/playlists_v5.sql';
+  static const String playlistSongsV5 =
+      'assets/db/migrations/playlist_songs_v5.sql';
+  static const String queueCacheV6 = 'assets/db/migrations/queue_cache_v6.sql';
+  static const String queueCacheV7 = 'assets/db/migrations/queue_cache_v7.sql';
+  static const String generatedPlaylists =
+      'assets/db/migrations/generated_playlists.sql';
+  static const String generatedPlaylistItems =
+      'assets/db/migrations/generated_playlist_items.sql';
+  static const String instantMixesV8 =
+      'assets/db/migrations/instant_mixes_v8.sql';
+  static const String animatedCoversV9 =
+      'assets/db/migrations/animated_covers_v9.sql';
+  static const String songPlaysV11 = 'assets/db/migrations/song_plays_v11.sql';
+  static const String playedSongsV12 =
+      'assets/db/migrations/played_songs_v12.sql';
+  static const String catalogCacheV14 =
+      'assets/db/migrations/catalog_cache_v14.sql';
+  static const String catalogArtistLinksV14 =
+      'assets/db/migrations/catalog_artist_links_v14.sql';
+  static const String pinsV15 = 'assets/db/migrations/pins_v15.sql';
+  static const String resumePointsV16 =
+      'assets/db/migrations/resume_points_v16.sql';
+}

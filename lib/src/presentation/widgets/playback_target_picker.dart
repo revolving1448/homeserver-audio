@@ -1,0 +1,1212 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_chrome_cast/flutter_chrome_cast.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/core/cast/cast_runtime.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/core/upnp/upnp_renderer.dart';
+import 'package:optional_features/jellybox_cloud.dart';
+import 'package:jplayer/src/domain/playback/cast_playback_target.dart';
+import 'package:jplayer/src/domain/playback/control_point_host_provider.dart';
+import 'package:jplayer/src/domain/playback/output_controller.dart';
+import 'package:jplayer/src/domain/playback/playback_target.dart';
+import 'package:jplayer/src/domain/playback/playback_target_provider.dart';
+import 'package:jplayer/src/domain/playback/speaker_clusters.dart';
+import 'package:jplayer/src/domain/playback/upnp_playback_target.dart';
+import 'package:jplayer/src/domain/providers/app_settings_provider.dart';
+import 'package:jplayer/src/domain/providers/cast_devices_provider.dart';
+import 'package:jplayer/src/domain/providers/cloud_provider.dart';
+import 'package:jplayer/src/domain/providers/output_route_provider.dart';
+import 'package:jplayer/src/domain/providers/speaker_groups_provider.dart';
+import 'package:jplayer/src/domain/providers/upnp_renderers_provider.dart';
+import 'package:jplayer/src/presentation/utils/utils.dart';
+import 'package:jplayer/src/presentation/widgets/adaptive_dialog_action.dart';
+import 'package:jplayer/src/presentation/widgets/anchored_dropdown.dart';
+import 'package:jplayer/src/presentation/widgets/form_modal.dart';
+import 'package:jplayer/src/presentation/widgets/frosted_panel.dart';
+import 'package:jplayer/src/presentation/widgets/hover_icon_button.dart';
+import 'package:jplayer/src/presentation/widgets/jellybox_cloud_settings.dart';
+import 'package:jplayer/src/presentation/widgets/marquee_text.dart';
+import 'package:jplayer/src/presentation/widgets/volume_control.dart';
+import 'package:jplayer/src/providers/color_scheme_provider.dart';
+import 'package:jplayer/src/providers/diagnostics_provider.dart';
+import 'package:native_route_picker/native_route_picker.dart';
+import 'package:optional_features/upnp_quirks.dart';
+
+const _menuWidth = 320.0;
+const _menuMaxHeight = 360.0;
+const IconData _castBadge = Icons.cast;
+const IconData _dlnaBadge = Icons.settings_input_antenna;
+
+typedef ActiveDevice = ({String name, IconData icon});
+
+final activeDeviceProvider = Provider<ActiveDevice?>((ref) {
+  final elsewhere = ref.watch(remoteRendererProvider);
+  if (elsewhere != null) {
+    return (
+      name: elsewhere.name,
+      icon: conductorDeviceIcon(elsewhere.platform),
+    );
+  }
+  final target = ref.watch(playbackTargetProvider);
+  if (target.kind == PlaybackTargetKind.local) {
+    final route = ref.watch(externalOutputRouteProvider);
+    return route == null
+        ? null
+        : (name: route.name, icon: outputRouteIcon(route.kind));
+  }
+  return (
+    name: switch (target) {
+      UpnpPlaybackTarget() => _speakerGroupName(ref, target),
+      _ => target.name,
+    },
+    icon: switch (target) {
+      UpnpPlaybackTarget() => rendererIcon(target.renderer),
+      CastPlaybackTarget() => castDeviceIcon(target.device),
+      _ => Icons.speaker,
+    },
+  );
+});
+
+String _speakerGroupName(Ref ref, UpnpPlaybackTarget target) {
+  final group = ref.watch(
+    speakerGroupsProvider.select(
+      (state) => state.topology.groupOf(target.id),
+    ),
+  );
+  final others = (group?.visibleMembers.length ?? 1) - 1;
+  return others > 0 ? '${target.name} + $others' : target.name;
+}
+
+class PlaybackTargetButton extends ConsumerStatefulWidget {
+  const PlaybackTargetButton({
+    super.key,
+    this.size,
+    this.color,
+    this.activeColor,
+    this.showsDeviceName = false,
+  });
+
+  final double? size;
+  final Color? color;
+  final Color? activeColor;
+  final bool showsDeviceName;
+
+  @override
+  ConsumerState<PlaybackTargetButton> createState() =>
+      _PlaybackTargetButtonState();
+}
+
+class PlaybackTargetMenuAnchor extends StatefulWidget {
+  const PlaybackTargetMenuAnchor({required this.builder, super.key});
+
+  final Widget Function(VoidCallback open) builder;
+
+  @override
+  State<PlaybackTargetMenuAnchor> createState() =>
+      _PlaybackTargetMenuAnchorState();
+}
+
+class _PlaybackTargetMenuAnchorState extends State<PlaybackTargetMenuAnchor> {
+  final _dropdown = AnchoredDropdownController();
+
+  void _open() {
+    final isDesktop = DeviceType.fromScreenSize(
+      MediaQuery.sizeOf(context),
+    ).isDesktop;
+    if (isDesktop) {
+      _dropdown.toggle();
+    } else {
+      unawaited(PlaybackTargetMenu.showSheet(context));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AnchoredDropdown(
+    controller: _dropdown,
+    direction: DropDirection.up,
+    menuBuilder: (context) => PlaybackTargetMenu(onDone: _dropdown.close),
+    child: widget.builder(_open),
+  );
+}
+
+class _PlaybackTargetButtonState extends ConsumerState<PlaybackTargetButton> {
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final target = ref.watch(playbackTargetProvider);
+    final casting = target.kind != PlaybackTargetKind.local;
+
+    final idleColor = widget.color ?? theme.colorScheme.onPrimary;
+    final activeColor =
+        widget.activeColor ?? ref.watch<Color>(accentColorProvider);
+
+    final box = widget.size;
+    final glyph = box == null ? IconTheme.of(context).size ?? 24 : box * 0.55;
+
+    final device = ref.watch(activeDeviceProvider);
+
+    return PlaybackTargetMenuAnchor(
+      builder: (open) => widget.showsDeviceName && device != null
+          ? _deviceName(theme, device.name, device.icon, activeColor, open)
+          : _icon(
+              casting: casting,
+              target: target,
+              box: box,
+              glyph: glyph,
+              idleColor: idleColor,
+              activeColor: activeColor,
+              open: open,
+            ),
+    );
+  }
+
+  Widget _deviceName(
+    ThemeData theme,
+    String name,
+    IconData icon,
+    Color color,
+    VoidCallback open,
+  ) => Semantics(
+    button: true,
+    label: 'Playing on $name. Choose a device',
+    child: InkWell(
+      onTap: open,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+        child: ExcludeSemantics(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 18, color: color),
+              const SizedBox(width: 6),
+              Flexible(
+                child: MarqueeText(
+                  name,
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: color,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+
+  Widget _icon({
+    required bool casting,
+    required PlaybackTarget target,
+    required double? box,
+    required double glyph,
+    required Color idleColor,
+    required Color activeColor,
+    required VoidCallback open,
+  }) => Stack(
+    clipBehavior: Clip.none,
+    children: [
+      HoverIconButton(
+        tooltip: casting ? 'Playing on ${target.name}' : 'Play on a device',
+        style: box == null
+            ? null
+            : ButtonStyle(
+                padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+                minimumSize: WidgetStatePropertyAll(Size.square(box)),
+                maximumSize: WidgetStatePropertyAll(Size.square(box)),
+              ),
+        iconSize: glyph,
+        color: idleColor,
+        selectedColor: activeColor,
+        icon: const Icon(Icons.cast),
+        selectedIcon: const Icon(Icons.cast_connected),
+        isSelected: casting,
+        onPressed: open,
+      ),
+      Positioned(
+        top: 0,
+        right: 0,
+        child: IgnorePointer(
+          child: _BetaBadge(
+            scale: glyph / 24,
+            background: activeColor,
+            foreground: idleColor,
+          ),
+        ),
+      ),
+    ],
+  );
+}
+
+class _BetaBadge extends StatelessWidget {
+  const _BetaBadge({
+    required this.scale,
+    required this.background,
+    required this.foreground,
+  });
+
+  final double scale;
+  final Color background;
+  final Color foreground;
+
+  @override
+  Widget build(BuildContext context) {
+    final fontSize = 9 * scale;
+    final letterSpacing = 0.4 * scale;
+    final padding = 4 * scale;
+
+    return Container(
+      height: fontSize + 4 * scale,
+      alignment: Alignment.center,
+      padding: EdgeInsets.only(
+        left: padding + letterSpacing / 2,
+        right: padding,
+        top: fontSize * 0.2,
+      ),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(4 * scale),
+      ),
+      child: Text(
+        'BETA',
+        textAlign: TextAlign.center,
+        strutStyle: StrutStyle(
+          fontSize: fontSize,
+          height: 1,
+          forceStrutHeight: true,
+        ),
+        style: TextStyle(
+          fontSize: fontSize,
+          height: 1,
+          letterSpacing: letterSpacing,
+          fontWeight: FontWeight.bold,
+          color: foreground,
+        ),
+      ),
+    );
+  }
+}
+
+class PlaybackTargetMenu extends ConsumerStatefulWidget {
+  const PlaybackTargetMenu({
+    required this.onDone,
+    this.inSheet = false,
+    super.key,
+  });
+
+  final VoidCallback onDone;
+  final bool inSheet;
+
+  static Future<void> showSheet(BuildContext context) =>
+      showModalBottomSheet<void>(
+        context: context,
+        useRootNavigator: true,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        builder: (sheetContext) => dismissOnEscape(
+          sheetContext,
+          PlaybackTargetMenu(
+            inSheet: true,
+            onDone: () => Navigator.of(sheetContext).pop(),
+          ),
+        ),
+      );
+
+  @override
+  ConsumerState<PlaybackTargetMenu> createState() => _PlaybackTargetMenuState();
+}
+
+class _PlaybackTargetMenuState extends ConsumerState<PlaybackTargetMenu> {
+  CastDevicesNotifier? _cast;
+  SpeakerGroupsNotifier? _household;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final cast = ref.read(castDevicesProvider.notifier);
+      _cast = cast;
+      cast.start();
+      final household = ref.read(speakerGroupsProvider.notifier);
+      _household = household;
+      household.watch();
+      unawaited(ref.read(upnpRenderersProvider.notifier).refresh());
+    });
+  }
+
+  @override
+  void dispose() {
+    _cast?.stop();
+    _household?.unwatch();
+    super.dispose();
+  }
+
+  OutputController get _outputs => ref.read(outputControllerProvider);
+
+  String? _failedHandoff;
+  String? _connecting;
+
+  void _selectLocal() {
+    unawaited(_outputs.playHere());
+    widget.onDone();
+  }
+
+  void _connectCloud() {
+    final navigator = Navigator.of(context, rootNavigator: true);
+    widget.onDone();
+    unawaited(connectJellyboxCloud(navigator.context));
+  }
+
+  Future<void> _handOffTo(ConductorDevice device) async {
+    setState(() => _failedHandoff = null);
+    final taken = await _outputs.handOffTo(device);
+    if (!mounted) return;
+    if (taken) {
+      widget.onDone();
+    } else {
+      setState(() => _failedHandoff = device.id);
+    }
+  }
+
+  String _deviceSubtitle(ConductorDevice device, CloudState conductor) {
+    if (conductor.handingOffTo == device.id) {
+      return device.isOnline ? 'Connecting…' : 'Waking up…';
+    }
+    if (_failedHandoff == device.id) {
+      return conductor.error ?? 'Could not take over';
+    }
+    if (device.isRenderer && _sessionFromAnotherServer) {
+      return 'Playing on a different server';
+    }
+    if (_onAnotherServer(device)) return 'Connected to a different server';
+    if (device.isRenderer) return 'Playing';
+    return device.isOnline ? 'Your device' : 'Asleep';
+  }
+
+  bool _onAnotherServer(ConductorDevice device) =>
+      ref.read(cloudProvider.notifier).sameBackend(device) == false;
+
+  bool get _sessionFromAnotherServer => !ref.watch(remoteSessionOursProvider);
+
+  void _selectRenderer(UpnpRenderer renderer) =>
+      unawaited(_connectTo(UpnpPlaybackTarget(renderer)));
+
+  void _selectCastDevice(GoogleCastDevice device) =>
+      unawaited(_connectTo(CastPlaybackTarget(device)));
+
+  Future<void> _connectTo(PlaybackTarget target) async {
+    setState(() => _connecting = target.id);
+    await _outputs.playOn(target);
+    if (!mounted) return;
+    final active = ref.read(playbackTargetProvider);
+    if (active.id == target.id && active.state.status != PlaybackStatus.error) {
+      widget.onDone();
+      return;
+    }
+    setState(() => _connecting = null);
+  }
+
+  Future<void> _selectCluster(SpeakerCluster cluster) async {
+    final coordinator = cluster.coordinator;
+    if (coordinator != null) return _selectRenderer(coordinator);
+    final location = cluster.coordinatorLocation;
+    if (location == null) return;
+    final placeholder = cluster.members.first.id;
+    setState(() => _connecting = placeholder);
+    final described = await ref
+        .read(upnpControlPointProvider)
+        .describe(location);
+    if (!mounted) return;
+    setState(() => _connecting = null);
+    if (described == null) return;
+    ref.read(upnpRenderersProvider.notifier).adopt(described);
+    await _connectTo(UpnpPlaybackTarget(described));
+  }
+
+  void _join(UpnpRenderer renderer) =>
+      unawaited(ref.read(speakerGroupsProvider.notifier).join(renderer.id));
+
+  void _leave(UpnpRenderer renderer) =>
+      unawaited(ref.read(speakerGroupsProvider.notifier).leave(renderer.id));
+
+  void _rescan() {
+    _cast?.refresh();
+    unawaited(ref.read(upnpRenderersProvider.notifier).refresh());
+  }
+
+  Future<void> _shareDevices(List<UpnpRenderer> renderers) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final diagnostics = ref.read(diagnosticsProvider);
+    final payload = deviceReportPayload(renderers);
+
+    widget.onDone();
+    final confirmed = await showAppDialog<bool>(
+      context,
+      builder: (context) => _ShareDevicesDialog(count: renderers.length),
+    );
+    if (confirmed != true) return;
+
+    await diagnostics.report(upnpDeviceReportMessage, data: payload);
+    messenger?.showSnackBar(
+      const SnackBar(content: Text('Device list sent. Thank you!')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final active = ref.watch(playbackTargetProvider);
+    final household = ref.watch(speakerGroupsProvider);
+    final discovery = ref.watch(upnpRenderersProvider);
+    final cast = ref.watch(castDevicesProvider);
+    final conductor = ref.watch(cloudProvider);
+    final host = ref.watch(controlPointHostProvider);
+    final scanning = discovery.scanning || cast.scanning;
+    final renderers = visibleRenderers(
+      discovery.renderers,
+      castDevices: cast.devices,
+      host: host,
+      activeId: active.id,
+    );
+    final width = math.min(_menuWidth, MediaQuery.sizeOf(context).width - 24);
+    final elsewhere = ref.watch(remoteRendererProvider);
+    final onThisDevice =
+        active.kind == PlaybackTargetKind.local && elsewhere == null;
+    final route = onThisDevice ? ref.watch(externalOutputRouteProvider) : null;
+
+    final list = SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 16, top: 8, right: 8),
+            child: Row(
+              children: [
+                Text('Play on', style: theme.textTheme.titleSmall),
+                const Spacer(),
+                if (scanning)
+                  const Padding(
+                    padding: EdgeInsets.all(12),
+                    child: SizedBox.square(
+                      dimension: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  )
+                else
+                  IconButton(
+                    tooltip: 'Scan again',
+                    iconSize: 18,
+                    icon: const Icon(Icons.refresh),
+                    onPressed: _rescan,
+                  ),
+                IconButton(
+                  tooltip: 'Share this device list with the developer',
+                  iconSize: 18,
+                  icon: const Icon(Icons.upload),
+                  onPressed: discovery.scanning || discovery.renderers.isEmpty
+                      ? null
+                      : () => _shareDevices(discovery.renderers),
+                ),
+              ],
+            ),
+          ),
+          if (route == null)
+            _TargetTile(
+              icon: _thisDeviceIcon,
+              title: 'This device',
+              selected: onThisDevice,
+              onTap: _selectLocal,
+            ),
+          if (ref.watch(cloudAvailableProvider) &&
+              conductor.account == null &&
+              !ref.watch(
+                settingProvider(AppSetting.hideContinuityInCastPicker),
+              ))
+            _TargetTile(
+              icon: Icons.cloud_off_outlined,
+              title: 'Continuity not available',
+              subtitle: 'Tap to connect',
+              selected: false,
+              onTap: _connectCloud,
+            ),
+          for (final device in conductor.targets) ...[
+            _TargetTile(
+              icon: conductorDeviceIcon(device.platform),
+              title: device.name,
+              subtitle: _deviceSubtitle(device, conductor),
+              selected: device.id == elsewhere?.id,
+              busy: conductor.handingOffTo == device.id,
+              onTap:
+                  device.isRenderer ||
+                      conductor.handingOffTo == device.id ||
+                      _onAnotherServer(device)
+                  ? null
+                  : () => unawaited(_handOffTo(device)),
+            ),
+            if (device.id == elsewhere?.id) _volume,
+          ],
+          for (final device in cast.devices) ...[
+            _TargetTile(
+              icon: castDeviceIcon(device),
+              badge: _castBadge,
+              title: device.friendlyName,
+              subtitle: ['Chromecast', ?device.modelName].join(' · '),
+              selected:
+                  elsewhere == null && active.id == 'cast:${device.deviceID}',
+              busy: _connecting == 'cast:${device.deviceID}',
+              onTap: _connecting != null
+                  ? null
+                  : () => _selectCastDevice(device),
+            ),
+            if (elsewhere == null && active.id == 'cast:${device.deviceID}')
+              _volume,
+          ],
+          ..._speakerSection(
+            renderers,
+            household,
+            active: elsewhere == null ? active : null,
+            host: host,
+            sharedNames: _sharedNames(renderers),
+          ),
+          for (final renderer in renderers)
+            if (!renderer.isGroupable) ...[
+              _rendererTile(
+                renderer,
+                selected: elsewhere == null && active.id == renderer.id,
+                host: host,
+                sharedNames: _sharedNames(renderers),
+              ),
+              if (elsewhere == null && active.id == renderer.id) _volume,
+            ],
+          if (renderers.isEmpty &&
+              cast.devices.isEmpty &&
+              conductor.targets.isEmpty &&
+              !scanning)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: Text(
+                castSupported
+                    ? 'No Cast or DLNA devices found on this network.'
+                    : 'No DLNA devices found on this network.',
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
+          if (NativeRoutePicker.isSupported) ...[
+            Builder(
+              builder: (row) => _TargetTile(
+                icon: route == null
+                    ? Icons.airplay
+                    : outputRouteIcon(route.kind),
+                title: 'AirPlay & Bluetooth',
+                subtitle: route?.name,
+                selected: route != null,
+                onTap: () => _showSystemOutputs(row),
+              ),
+            ),
+            if (route != null) _volume,
+          ],
+        ],
+      ),
+    );
+
+    final palette = ref.watch(artworkSchemeProvider).valueOrNull;
+
+    if (widget.inSheet) {
+      return FrostedPanel(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
+        child: SafeArea(
+          top: false,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+            ),
+            child: list,
+          ),
+        ),
+      );
+    }
+
+    return Theme(
+      data: palette == null ? theme : theme.copyWith(colorScheme: palette),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x80000000),
+              blurRadius: 32,
+              offset: Offset(0, 12),
+            ),
+          ],
+        ),
+        child: FrostedPanel(
+          borderRadius: BorderRadius.circular(12),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: width,
+              minWidth: width,
+              maxHeight: _menuMaxHeight,
+            ),
+            child: list,
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showSystemOutputs(BuildContext row) {
+    final box = row.findRenderObject() as RenderBox?;
+    final anchor = box?.localToGlobal(box.size.center(Offset.zero));
+    if (ref.read(playingElsewhereProvider)) unawaited(_outputs.playHere());
+    widget.onDone();
+    unawaited(NativeRoutePicker.showOutputSwitcher(anchor: anchor));
+  }
+
+  Widget get _volume => const DeviceVolumeSlider(
+    padding: EdgeInsets.only(left: 12, right: 16, bottom: 4),
+  );
+
+  static Set<String> _sharedNames(List<UpnpRenderer> renderers) {
+    final seen = <String>{};
+    return {
+      for (final renderer in renderers)
+        if (!seen.add(renderer.name)) renderer.name,
+    };
+  }
+
+  static String _dlnaSubtitle(UpnpRenderer renderer, Set<String> sharedNames) =>
+      [
+        'DLNA',
+        if (sharedNames.contains(renderer.name)) renderer.host,
+        ?renderer.model,
+      ].join(' · ');
+
+  List<Widget> _speakerSection(
+    List<UpnpRenderer> renderers,
+    SpeakerGroupsState household, {
+    required PlaybackTarget? active,
+    required ControlPointHost host,
+    required Set<String> sharedNames,
+  }) {
+    final clusters = speakerClusters(renderers, household.topology);
+    if (clusters.isEmpty) return const [];
+    final activeId = active is UpnpPlaybackTarget && active.renderer.isGroupable
+        ? active.id
+        : null;
+
+    return [
+      for (final cluster in clusters)
+        _speakerCluster(
+          cluster,
+          household,
+          activeId: activeId,
+          isActive: activeId != null && cluster.contains(activeId),
+          host: host,
+          sharedNames: sharedNames,
+        ),
+    ];
+  }
+
+  Widget _speakerCluster(
+    SpeakerCluster cluster,
+    SpeakerGroupsState household, {
+    required String? activeId,
+    required bool isActive,
+    required ControlPointHost host,
+    required Set<String> sharedNames,
+  }) {
+    final together = cluster.members.length > 1;
+    final children = <Widget>[
+      if (isActive && together)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+          child: Text(
+            'Group volume',
+            style: Theme.of(context).textTheme.labelSmall,
+          ),
+        ),
+      if (isActive && together) _volume,
+      for (final renderer in cluster.members) ...[
+        _speakerTile(
+          renderer,
+          cluster,
+          household,
+          selected: renderer.id == activeId,
+          isActive: isActive,
+          canJoin: activeId != null && !isActive,
+          host: host,
+          sharedNames: sharedNames,
+        ),
+        if (isActive && together) _SpeakerVolumeSlider(renderer.id),
+        if (isActive && !together && renderer.id == activeId) _volume,
+      ],
+    ];
+    if (!together) return Column(children: children);
+    return _ClusterCard(highlighted: isActive, children: children);
+  }
+
+  Widget _speakerTile(
+    UpnpRenderer renderer,
+    SpeakerCluster cluster,
+    SpeakerGroupsState household, {
+    required bool selected,
+    required bool isActive,
+    required bool canJoin,
+    required ControlPointHost host,
+    required Set<String> sharedNames,
+  }) {
+    final blocked = castingBlockedReason(
+      deviceHoldsQueue: renderer.holdsQueue,
+      host: host,
+    );
+    final busy =
+        _connecting == renderer.id || household.busy.contains(renderer.id);
+    final isCoordinator = renderer.id == cluster.coordinator?.id;
+
+    Widget? action;
+    if (!busy && canJoin && blocked == null) {
+      action = _GroupAction.join(onPressed: () => _join(renderer));
+    } else if (!busy && isActive && !selected) {
+      action = _GroupAction.leave(onPressed: () => _leave(renderer));
+    }
+
+    final subtitle = cluster.members.length > 1 || !isCoordinator
+        ? renderer.model
+        : _dlnaSubtitle(renderer, sharedNames);
+
+    return _TargetTile(
+      icon: rendererIcon(renderer),
+      image: renderer.iconUrl,
+      badge: _dlnaBadge,
+      title: renderer.name,
+      subtitle: blocked ?? subtitle,
+      selected: selected,
+      busy: busy,
+      action: action,
+      onTap: blocked != null || _connecting != null
+          ? null
+          : isActive
+          ? widget.onDone
+          : () => unawaited(_selectCluster(cluster)),
+    );
+  }
+
+  Widget _rendererTile(
+    UpnpRenderer renderer, {
+    required bool selected,
+    required ControlPointHost host,
+    required Set<String> sharedNames,
+  }) {
+    final blocked = castingBlockedReason(
+      deviceHoldsQueue: renderer.holdsQueue,
+      host: host,
+    );
+
+    return _TargetTile(
+      icon: rendererIcon(renderer),
+      badge: _dlnaBadge,
+      title: renderer.name,
+      subtitle: blocked ?? _dlnaSubtitle(renderer, sharedNames),
+      selected: selected,
+      busy: _connecting == renderer.id,
+      onTap: blocked == null && _connecting == null
+          ? () => _selectRenderer(renderer)
+          : null,
+    );
+  }
+
+  IconData get _thisDeviceIcon {
+    if (Platform.isIOS) return Icons.phone_iphone;
+    if (Platform.isAndroid) return Icons.smartphone;
+    return Icons.laptop_mac;
+  }
+}
+
+IconData conductorDeviceIcon(String platform) => switch (platform) {
+  'ios' => Icons.phone_iphone,
+  'android' => Icons.phone_android,
+  'androidtv' => Icons.tv_rounded,
+  'macos' => Icons.laptop_mac,
+  'windows' => Icons.laptop_windows,
+  'linux' => Icons.computer,
+  _ => Icons.devices_other,
+};
+
+IconData outputRouteIcon(OutputRouteKind kind) => switch (kind) {
+  OutputRouteKind.airPlay => Icons.airplay,
+  OutputRouteKind.bluetooth => Icons.bluetooth_audio,
+  OutputRouteKind.wired => Icons.headphones,
+  OutputRouteKind.car => Icons.directions_car,
+  OutputRouteKind.builtIn || OutputRouteKind.other => Icons.speaker,
+};
+
+List<UpnpRenderer> visibleRenderers(
+  List<UpnpRenderer> renderers, {
+  required List<GoogleCastDevice> castDevices,
+  required ControlPointHost host,
+  String? activeId,
+}) => [
+  for (final renderer in renderers)
+    if (renderer.id == activeId ||
+        castingBlockedReason(
+              deviceHoldsQueue: renderer.holdsQueue,
+              host: host,
+            ) ==
+            null ||
+        !castDevices.any((device) => _sameEndDevice(device, renderer)))
+      renderer,
+];
+
+bool _sameEndDevice(GoogleCastDevice device, UpnpRenderer renderer) {
+  final ip = device.ipAddress;
+  if (ip != null && ip.isNotEmpty) return ip == renderer.host;
+  return _plainName(device.friendlyName) == _plainName(renderer.name);
+}
+
+String _plainName(String name) =>
+    name.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+IconData castDeviceIcon(GoogleCastDevice device) {
+  final haystack = [
+    device.friendlyName,
+    device.modelName ?? '',
+  ].join(' ').toLowerCase();
+
+  if (haystack.contains('tv') ||
+      haystack.contains('display') ||
+      haystack.contains('chromecast') ||
+      haystack.contains('shield')) {
+    return Icons.tv;
+  }
+  return Icons.speaker;
+}
+
+IconData rendererIcon(UpnpRenderer renderer) {
+  final haystack = [
+    renderer.name,
+    renderer.model ?? '',
+    renderer.device.deviceType,
+  ].join(' ').toLowerCase();
+
+  if (haystack.contains('tv') ||
+      haystack.contains('display') ||
+      haystack.contains('screen') ||
+      haystack.contains('bravia') ||
+      haystack.contains('roku')) {
+    return Icons.tv;
+  }
+  if (haystack.contains('receiver') ||
+      haystack.contains('amplifier') ||
+      haystack.contains('denon') ||
+      haystack.contains('yamaha') ||
+      haystack.contains('marantz')) {
+    return Icons.settings_input_component;
+  }
+  return Icons.speaker;
+}
+
+class _TargetTile extends StatelessWidget {
+  const _TargetTile({
+    required this.icon,
+    required this.title,
+    required this.selected,
+    required this.onTap,
+    this.badge,
+    this.image,
+    this.subtitle,
+    this.busy = false,
+    this.action,
+  });
+
+  final IconData icon;
+  final IconData? badge;
+  final Uri? image;
+  final String title;
+  final String? subtitle;
+  final bool selected;
+  final bool busy;
+  final Widget? action;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final disabled = onTap == null && !busy;
+    final tint = disabled
+        ? theme.disabledColor
+        : (selected ? theme.colorScheme.primary : null);
+
+    final tile = ListTile(
+      dense: true,
+      enabled: !disabled,
+      hoverColor: theme.colorScheme.onSurface.withValues(alpha: 0.06),
+      leading: _TileIcon(icon: icon, image: image, badge: badge, tint: tint),
+      title: Text(title, style: TextStyle(color: tint)),
+      subtitle: subtitle == null
+          ? null
+          : Text(
+              subtitle!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall,
+            ),
+      trailing: busy
+          ? const SizedBox.square(
+              dimension: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : action ??
+                (selected
+                    ? Icon(
+                        Icons.check,
+                        size: 18,
+                        color: theme.colorScheme.primary,
+                      )
+                    : null),
+      onTap: onTap,
+    );
+
+    return Material(type: MaterialType.transparency, child: tile);
+  }
+}
+
+class _GroupAction extends StatelessWidget {
+  const _GroupAction.join({required this.onPressed})
+    : icon = Icons.add_circle_outline_rounded,
+      tooltip = 'Join group';
+
+  const _GroupAction.leave({required this.onPressed})
+    : icon = Icons.remove_circle_outline_rounded,
+      tooltip = 'Leave group';
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => HoverIconButton(
+    onPressed: onPressed,
+    tooltip: tooltip,
+    iconSize: 20,
+    color: Theme.of(context).colorScheme.onSurface,
+    icon: Icon(icon),
+  );
+}
+
+class _ClusterCard extends StatelessWidget {
+  const _ClusterCard({required this.children, required this.highlighted});
+
+  final List<Widget> children;
+  final bool highlighted;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final tint = highlighted ? scheme.primary : scheme.onSurface;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          color: tint.withValues(alpha: highlighted ? 0.06 : 0.04),
+          border: Border.all(
+            color: tint.withValues(alpha: highlighted ? 0.35 : 0.12),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: children,
+        ),
+      ),
+    );
+  }
+}
+
+class _SpeakerVolumeSlider extends ConsumerWidget {
+  const _SpeakerVolumeSlider(this.speakerId);
+
+  final String speakerId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final theme = Theme.of(context);
+    final volume = ref.watch(
+      speakerGroupsProvider.select((state) => state.volumes[speakerId]),
+    );
+    final notifier = ref.read(speakerGroupsProvider.notifier);
+    final tint = theme.colorScheme.onSurface.withValues(alpha: 0.7);
+
+    return Padding(
+      padding: const EdgeInsets.only(left: 20, right: 16, bottom: 2),
+      child: Row(
+        children: [
+          Icon(Icons.volume_down_rounded, size: 16, color: tint),
+          Expanded(
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3,
+                activeTrackColor: tint,
+                inactiveTrackColor: tint.withValues(alpha: 0.25),
+                thumbColor: tint,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5),
+                overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+              ),
+              child: Slider(
+                value: (volume ?? 0) / 100,
+                onChanged: volume == null
+                    ? null
+                    : (value) => unawaited(
+                        notifier.setMemberVolume(
+                          speakerId,
+                          value,
+                          settle: false,
+                        ),
+                      ),
+                onChangeEnd: (value) =>
+                    unawaited(notifier.setMemberVolume(speakerId, value)),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TileIcon extends StatelessWidget {
+  const _TileIcon({
+    required this.icon,
+    required this.badge,
+    required this.tint,
+    this.image,
+  });
+
+  final IconData icon;
+  final IconData? badge;
+  final Uri? image;
+  final Color? tint;
+
+  @override
+  Widget build(BuildContext context) {
+    final fallback = Icon(icon, color: tint, size: 20);
+    final picture = image;
+    final glyph = picture == null
+        ? fallback
+        : SizedBox.square(
+            dimension: 20,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.onSurface.withValues(
+                  alpha: 0.14,
+                ),
+                borderRadius: BorderRadius.circular(5),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(2),
+                child: Image.network(
+                  '$picture',
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, _, _) => fallback,
+                ),
+              ),
+            ),
+          );
+    final mark = badge;
+    if (mark == null) return glyph;
+
+    return SizedBox.square(
+      dimension: 20,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          glyph,
+          Positioned(
+            right: -4,
+            bottom: -4,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                shape: BoxShape.circle,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(1),
+                child: Icon(mark, size: 11, color: tint),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+const upnpDeviceReportMessage = 'upnp device report';
+
+Map<String, Object?> deviceReportPayload(List<UpnpRenderer> renderers) => {
+  'devices': [
+    for (final renderer in renderers) _reportEntry(renderer),
+  ],
+};
+
+Map<String, Object?> _reportEntry(UpnpRenderer renderer) {
+  final fingerprint = renderer.fingerprint;
+  return {
+    'manufacturer': fingerprint.manufacturer,
+    'modelName': fingerprint.modelName,
+    'modelNumber': fingerprint.modelNumber,
+    'deviceType': fingerprint.deviceType,
+    'hasFriendlyName': fingerprint.friendlyName != null,
+    'hasRoomName': renderer.device.roomName != null,
+    'services': {
+      for (final service in fingerprint.services) service: true,
+    },
+    'actions': {for (final action in fingerprint.actions) action: true},
+    'sinkMimeTypes': {
+      for (final mimeType in fingerprint.sinkMimeTypes) mimeType: true,
+    },
+    'queue': renderer.queueKind.name,
+    'queueDriven': renderer.holdsQueue,
+    'groups': renderer.isGroupable,
+    'quirks': renderer.quirks.toJson(),
+    'rules': rulesFor(fingerprint).map((rule) => rule.name).toList(),
+  };
+}
+
+class _ShareDevicesDialog extends StatelessWidget {
+  const _ShareDevicesDialog({required this.count});
+
+  final int count;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog.adaptive(
+    title: const Text('Share what JellyBox found?'),
+    content: Text(
+      count == 1
+          ? 'Send the details of the DLNA device on your network? It stays '
+                'private and is only used to build proper support for '
+                'different manufacturers.'
+          : 'Send the details of the $count DLNA devices on your network? It '
+                'stays private and is only used to build proper support for '
+                'different manufacturers.',
+    ),
+    actions: [
+      AdaptiveDialogAction(
+        onPressed: () => Navigator.pop(context, false),
+        child: const Text('Not now'),
+      ),
+      AdaptiveDialogAction(
+        onPressed: () => Navigator.pop(context, true),
+        isDefaultAction: true,
+        child: const Text('Share'),
+      ),
+    ],
+  );
+}

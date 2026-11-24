@@ -1,0 +1,235 @@
+import 'dart:async';
+import 'dart:ui' show ImageFilter;
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/domain/providers/device_volume_provider.dart';
+import 'package:jplayer/src/domain/providers/volume_provider.dart';
+import 'package:jplayer/src/presentation/widgets/hover_icon_button.dart';
+
+const _buttonSize = 44.0;
+const _sliderLength = 150.0;
+const _sliderPadding = 14.0;
+const _hideDelay = Duration(milliseconds: 150);
+const _wheelSettleDelay = Duration(milliseconds: 100);
+const _wheelLevelPerPixel = 0.0004;
+
+class VolumeControl extends ConsumerStatefulWidget {
+  const VolumeControl({this.size = _buttonSize, this.color, super.key});
+
+  final double size;
+  final Color? color;
+
+  @override
+  ConsumerState<VolumeControl> createState() => _VolumeControlState();
+}
+
+class _VolumeControlState extends ConsumerState<VolumeControl>
+    with _VolumeLevel {
+  final _portalController = OverlayPortalController();
+  final _link = LayerLink();
+  Timer? _hideTimer;
+  Timer? _wheelTimer;
+  bool _expanded = false;
+
+  void _show() {
+    _hideTimer?.cancel();
+    if (_expanded) return;
+    setState(() => _expanded = true);
+    _portalController.show();
+  }
+
+  void _scheduleHide() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(_hideDelay, () {
+      if (!mounted || !_expanded) return;
+      setState(() => _expanded = false);
+      _portalController.hide();
+    });
+  }
+
+  void _onPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    final delta = -event.scrollDelta.dy * _wheelLevelPerPixel;
+    if (delta == 0) return;
+    _setLevel(_level + delta, settle: false);
+    _wheelTimer?.cancel();
+    _wheelTimer = Timer(_wheelSettleDelay, () {
+      if (mounted) _setLevel(_level);
+    });
+  }
+
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    _wheelTimer?.cancel();
+    super.dispose();
+  }
+
+  Color _tint(ThemeData theme) => widget.color ?? theme.colorScheme.onPrimary;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final volume = _watchVolume();
+
+    return OverlayPortal(
+      controller: _portalController,
+      overlayChildBuilder: (context) => Align(
+        alignment: Alignment.topLeft,
+        child: CompositedTransformFollower(
+          link: _link,
+          targetAnchor: Alignment.bottomCenter,
+          followerAnchor: Alignment.bottomCenter,
+          child: _capsule(theme, volume),
+        ),
+      ),
+      child: CompositedTransformTarget(
+        link: _link,
+        child: MouseRegion(
+          onEnter: (_) => _show(),
+          onExit: (_) => _scheduleHide(),
+          child: Opacity(
+            opacity: _expanded ? 0 : 1,
+            child: _muteButton(theme, volume),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _capsule(ThemeData theme, VolumeState volume) => MouseRegion(
+    onEnter: (_) => _show(),
+    onExit: (_) => _scheduleHide(),
+    child: Listener(
+      onPointerSignal: _onPointerSignal,
+      child: SizedBox(
+        width: widget.size,
+        height: _sliderLength + widget.size,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(widget.size / 2),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+            child: ColoredBox(
+              color: Colors.black.withOpacity(0.35),
+              child: Column(
+                children: [
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: _sliderPadding),
+                      child: _slider(theme, volume),
+                    ),
+                  ),
+                  _muteButton(theme, volume),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  Widget _slider(ThemeData theme, VolumeState volume) => RotatedBox(
+    quarterTurns: 3,
+    child: SliderTheme(
+      data: SliderTheme.of(context).copyWith(
+        trackHeight: 4,
+        activeTrackColor: _tint(theme),
+        inactiveTrackColor: _tint(theme).withOpacity(0.25),
+        thumbColor: _tint(theme),
+        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+        overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+      ),
+      child: Slider(
+        value: volume.effectiveLevel,
+        onChanged: (value) => _setLevel(value, settle: false),
+        onChangeEnd: _setLevel,
+      ),
+    ),
+  );
+
+  Widget _muteButton(ThemeData theme, VolumeState volume) => HoverIconButton(
+    onPressed: _toggleMute,
+    style: ButtonStyle(
+      padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+      minimumSize: WidgetStatePropertyAll(Size.square(widget.size)),
+      maximumSize: WidgetStatePropertyAll(Size.square(widget.size)),
+    ),
+    color: _tint(theme),
+    iconSize: widget.size * 0.55,
+    icon: Icon(_iconFor(volume)),
+  );
+}
+
+mixin _VolumeLevel<T extends ConsumerStatefulWidget> on ConsumerState<T> {
+  DeviceVolumeNotifier get _volume => ref.read(deviceVolumeProvider.notifier);
+
+  double get _level => ref.read(deviceVolumeProvider).level;
+
+  VolumeState _watchVolume() => ref.watch(deviceVolumeProvider);
+
+  void _setLevel(double value, {bool settle = true}) =>
+      unawaited(_volume.setLevel(value, settle: settle));
+
+  void _toggleMute() => unawaited(_volume.toggleMute());
+
+  IconData _iconFor(VolumeState volume) {
+    if (volume.isSilent) return Icons.volume_off_rounded;
+    if (volume.effectiveLevel < 0.34) return Icons.volume_mute_rounded;
+    if (volume.effectiveLevel < 0.67) return Icons.volume_down_rounded;
+    return Icons.volume_up_rounded;
+  }
+}
+
+class DeviceVolumeSlider extends ConsumerStatefulWidget {
+  const DeviceVolumeSlider({this.padding = EdgeInsets.zero, super.key});
+
+  final EdgeInsets padding;
+
+  @override
+  ConsumerState<DeviceVolumeSlider> createState() => _DeviceVolumeSliderState();
+}
+
+class _DeviceVolumeSliderState extends ConsumerState<DeviceVolumeSlider>
+    with _VolumeLevel {
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final volume = _watchVolume();
+    final tint = theme.colorScheme.primary;
+
+    return Padding(
+      padding: widget.padding,
+      child: Row(
+        children: [
+          HoverIconButton(
+            onPressed: _toggleMute,
+            tooltip: volume.isSilent ? 'Unmute' : 'Mute',
+            iconSize: 20,
+            color: theme.colorScheme.onSurface,
+            icon: Icon(_iconFor(volume)),
+          ),
+          Expanded(
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 4,
+                activeTrackColor: tint,
+                inactiveTrackColor: tint.withValues(alpha: 0.25),
+                thumbColor: tint,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+                overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+              ),
+              child: Slider(
+                value: volume.effectiveLevel,
+                onChanged: (value) => _setLevel(value, settle: false),
+                onChangeEnd: _setLevel,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

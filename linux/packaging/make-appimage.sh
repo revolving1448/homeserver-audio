@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUNDLE_DIR="${1:?usage: make-appimage.sh <bundle-dir> <output-appimage> <version>}"
+OUT="${2:?}"
+VERSION="${3:?}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+APPDIR="$WORK/AppDir"
+mkdir -p "$APPDIR"
+cp -a "$BUNDLE_DIR/." "$APPDIR/"
+
+install -m755 "$SCRIPT_DIR/AppRun" "$APPDIR/AppRun"
+sed "s|@VERSION@|$VERSION|" "$SCRIPT_DIR/com.prodigytech.jellybox.desktop" > "$APPDIR/com.prodigytech.jellybox.desktop"
+install -m644 "$SCRIPT_DIR/jellybox.png" "$APPDIR/jellybox.png"
+ln -sf jellybox.png "$APPDIR/.DirIcon"
+
+# The same AppStream metainfo the Flatpak ships; appdir-lint warns without it
+# and the catalog page takes its summary and screenshots from here.
+mkdir -p "$APPDIR/usr/share/metainfo"
+sed -e "s|@VERSION@|$VERSION|" -e "s|@DATE@|$(date -u +%Y-%m-%d)|" \
+  "$SCRIPT_DIR/flatpak/com.prodigytech.jellybox.metainfo.xml" \
+  > "$APPDIR/usr/share/metainfo/com.prodigytech.jellybox.metainfo.xml"
+
+# appimagetool is itself an AppImage, so it has to match the host arch.
+case "$(uname -m)" in
+  x86_64)  TOOL_ARCH=x86_64 ;;
+  aarch64) TOOL_ARCH=aarch64 ;;
+  *) echo "error: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
+APPIMAGETOOL="$WORK/appimagetool.AppImage"
+curl -fsSL -o "$APPIMAGETOOL" \
+  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${TOOL_ARCH}.AppImage"
+chmod +x "$APPIMAGETOOL"
+
+# --appimage-extract-and-run avoids needing FUSE, which CI runners lack.
+"$APPIMAGETOOL" --appimage-extract-and-run "$APPDIR" "$OUT"

@@ -1,0 +1,171 @@
+## 0.0.1-beta.17+jellybox.9 (LOCAL FORK)
+
+* PATCH: a `ConcatenatingAudioSourceMessage` whose `shuffleOrder` is not a
+  permutation of its children falls back to queue order (with a `[Session]`
+  log line) instead of throwing a `RangeError` from `shuffleIndices`.
+  just_audio 0.10.6 hands the handler its live shuffle list by reference
+  (ryanheise/just_audio#1573), so a message kept across a queue replacement
+  could point at a list sized for the next queue. The app avoids the sharing
+  by giving every load its own `QueueShuffleOrder`; this keeps a stale message
+  harmless if it happens again (JellyBoxPlayer#489).
+
+## 0.0.1-beta.17+jellybox.8 (LOCAL FORK)
+
+* PATCH: `JustAudioBackground.remoteHandler` hands the media session to an
+  app-supplied `AudioHandler` while audio plays on another device, so the
+  notification, lock-screen controls, remote volume (`androidPlaybackInfo`)
+  and the foreground service follow the renderer. The local player's handler
+  keeps running underneath: `_JustAudioPlayer` now talks to it directly
+  (events, pause, stop, repeat mode) instead of going through the switch, and
+  a player created while the remote handler is installed no longer takes the
+  session back (`playerReady`). Clearing the remote handler re-emits
+  `LocalAndroidPlaybackInfo` so the phone's volume keys return to the phone.
+
+## 0.0.1-beta.17+jellybox.7 (LOCAL FORK)
+
+* PATCH: `[Session]` log lines (via `debugPrint`, so they reach the app's
+  on-device log) at every point the session can diverge from the player: a
+  media-session play or media button and which path it took, handler
+  play/pause/stop with the `_playing`/`_playerPlaying`/`_holding` flags and
+  whether a native player exists, hold/release, and native player errors. No
+  behaviour change.
+
+## 0.0.1-beta.17+jellybox.6 (LOCAL FORK)
+
+* PATCH: a playback error while playing no longer tears the session down. The
+  handler keeps reporting "buffering" (not idle) through the native player's
+  disposal, so the foreground service, notification and metadata survive while
+  the app retries the queue — Android 17 mutes background audio that starts
+  without a foreground service, and a car head unit drops play presses sent to
+  an inactive session. The app asks for it with
+  `JustAudioBackground.holdPlayback(onCancelled:)` when it defers a load that
+  was meant to play; a pause from the notification or a car runs `onCancelled`
+  so the app stops retrying, and `cancelPendingPlayback()` releases the hold
+  when the app gives up itself. A held session already reports playing, so the
+  handler tracks whether the *current* native player was told to play and
+  always forwards the first play after a reload (otherwise the reload came up
+  silent with the progress bar running). `pause()` no longer awaits a player
+  that was disposed.
+
+## 0.0.1-beta.17+jellybox.5 (LOCAL FORK)
+
+* PATCH: `JustAudioBackground.playHandler` routes media-session play (Android
+  Auto, steering wheel, notification, lock screen, headset click) to the app's
+  `AudioPlayer.play()` instead of straight to the native player. Upstream's
+  path skipped `AudioSession.setActive`, so on Android those plays never took
+  audio focus: they played over other apps, and Android Auto could keep the car
+  silent while the progress bar ran. It also hung forever after
+  `AudioPlayer.stop()` had released the platform player, showing "playing" with
+  nothing loaded. `_JustAudioPlayer.play` now calls `_PlayerAudioHandler.play`
+  directly so the app's own play requests don't loop back through the handler.
+
+## 0.0.1-beta.17+jellybox.3 (LOCAL FORK)
+
+* `JustAudioBackground.rememberPlay()` is public so the iOS home screen widget
+  can record a play tap that arrives before the queue is restored, the same way
+  a cold-start media button press is recorded.
+
+## 0.0.1-beta.17+jellybox.2 (LOCAL FORK)
+
+* PATCH: media-browser hook for Android Auto. `JustAudioBackground.browseDelegate`
+  installs an `AudioBrowseDelegate` that answers `getChildren`, `getMediaItem`,
+  `search`, `playFromMediaId` and `playFromSearch`. The handler registered with
+  audio_service is now `_BrowsingSwitchAudioHandler`, which owns the
+  `subscribeToChildren` subjects itself (audio_service caches the first stream
+  it gets per parent id for the life of the service) and forwards browse calls to
+  the delegate regardless of whether an `AudioPlayer` exists yet, so a cold
+  start from the car can browse before anything plays. Upstream has no way to
+  reach the browse callbacks without replacing `just_audio_background` outright.
+
+## 0.0.1-beta.17+jellybox.1 (LOCAL FORK)
+
+Vendored copy of upstream 0.0.1-beta.17 with a local patch. Do not replace with
+the pub.dev version without re-applying the patch below.
+
+* PATCH: `skipToPrevious` now restarts the current track if playback is more
+  than 3s in (or there is no earlier track), otherwise skips to the previous
+  track — matching the in-app prev button. Upstream skipped unconditionally and
+  exposes no hook to customise this, so the media-session / lock-screen prev
+  button ignored the restart threshold.
+
+## 0.0.1-beta.17
+
+* Fix notification dismissal on player.stop (@rserro).
+
+## 0.0.1-beta.16
+
+* Support errorCode, errorMessage.
+* Bump min flutter version to 3.27.0, AGP to 8.5.2.
+
+## 0.0.1-beta.15
+
+* Add setWebSinkId for web.
+
+## 0.0.1-beta.14
+
+* Fix shuffleOrder when mutating ConcatenatingAudioSource (@jonmarkhall).
+
+## 0.0.1-beta.13
+
+* Support rxdart 0.28.x.
+
+## 0.0.1-beta.12
+
+* Support setWebCrossOrigin.
+
+## 0.0.1-beta.11
+
+* Pass through missing API methods.
+
+## 0.0.1-beta.10
+
+* Fix bug where AudioPlayer constructor parameters were ignored.
+* Update minimum flutter version to 3.0.
+
+## 0.0.1-beta.9
+
+* Fix currentIndex stutter.
+* Performance and lint fixes (@Zekfad).
+
+## 0.0.1-beta.8
+
+* Fix performance issues when shuffleMode is enabled (@agersant)
+
+## 0.0.1-beta.7
+
+* Fix build when targeting Android 13.
+* Add MediaItem.artHeaders.
+
+## 0.0.1-beta.6
+
+* Update documentation/example for Android 12.
+* Migrate from pedantic to flutter_lints.
+* Support content:// art URIs on Android (@nt4f04uNd).
+
+## 0.0.1-beta.5
+
+* Fix bug in stop.
+
+## 0.0.1-beta.4
+
+* Implement disposeAllPlayers.
+
+## 0.0.1-beta.3
+
+* Fix build when targeting Android 12.
+
+## 0.0.1-beta.2
+
+* Remove Android notification on stop.
+
+## 0.0.1-beta.1
+
+* Disable next/prev buttons when boundary reached.
+
+## 0.0.1-beta.0+1
+
+* Fix README typo.
+
+## 0.0.1-beta.0
+
+* Prerelease of initial version.

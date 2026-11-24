@@ -1,0 +1,550 @@
+import 'dart:async';
+
+import 'package:collection/collection.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:jplayer/src/config/routes.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/presentation/utils/utils.dart';
+import 'package:jplayer/src/presentation/widgets/widgets.dart';
+import 'package:jplayer/src/providers/connectivity_provider.dart';
+import 'package:jplayer/src/providers/dev_tools_provider.dart';
+import 'package:jplayer/src/domain/providers/discovery_home_provider.dart';
+import 'package:jplayer/src/domain/providers/seed_radio_provider.dart';
+import 'package:jplayer/src/presentation/widgets/speed_dial_section.dart';
+import 'package:jplayer/src/presentation/widgets/spoken_audio_hub.dart';
+import 'package:jplayer/src/data/backend/subsonic/spoken_audio_service.dart';
+import 'package:jplayer/src/providers/image_service_provider.dart';
+
+class HomePage extends ConsumerStatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  ConsumerState<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends ConsumerState<HomePage> {
+  static const _iconRowHeight = 48.0;
+
+  late DeviceType _device;
+  Timer? _updateTimer;
+  int _category = 0;
+
+  Widget _categoryPicker() => Padding(
+    padding: EdgeInsets.fromLTRB(
+      _horizontalPadding,
+      12,
+      _horizontalPadding,
+      16,
+    ),
+    child: Wrap(
+      spacing: 8,
+      children: [
+        for (final (index, label) in [
+          'Music',
+          'Podcasts',
+          'Audiobooks',
+        ].indexed)
+          ChoiceChip(
+            label: Text(label),
+            selected: _category == index,
+            onSelected: (_) => setState(() => _category = index),
+          ),
+      ],
+    ),
+  );
+
+  double get _horizontalPadding => _device.isMobile ? 16 : 30;
+
+  double get _navigationBarHeight => _device.isMobile ? _iconRowHeight : 100;
+
+  @override
+  void initState() {
+    super.initState();
+    ref.listenManual(
+      contentUpdateIntervalProvider,
+      (_, interval) => _scheduleUpdates(interval),
+      fireImmediately: true,
+    );
+  }
+
+  @override
+  void dispose() {
+    _updateTimer?.cancel();
+    super.dispose();
+  }
+
+  void _scheduleUpdates(ContentUpdateInterval interval) {
+    _updateTimer?.cancel();
+    final duration = interval.duration;
+    if (duration == null) return;
+    _updateTimer = Timer.periodic(duration, (_) => _updateContent());
+  }
+
+  void _updateContent() {
+    if (ref.read(isOfflineProvider)) return;
+    ref.refreshHomeSections();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _device = DeviceType.fromScreenSize(MediaQuery.sizeOf(context));
+  }
+
+  List<ContextMenuAction> Function(BuildContext, LibraryItem) _cardOptions(
+    ProviderOrFamily provider,
+  ) =>
+      (context, item) => contextMenuActions(
+        context,
+        ref,
+        item,
+        scope: ContextMenuScope.browse,
+        onLike: (item) async {
+          await toggleFavourite(ref, item);
+          ref.invalidate(provider);
+        },
+      );
+
+  List<ContextMenuAction> _setOptions(BuildContext context, LibraryItem item) =>
+      contextMenuActions(context, ref, item, scope: ContextMenuScope.browse);
+
+  void _onAlbumTap(LibraryItem album) {
+    context.pushNamed(
+      branchAwareName(context, Routes.album),
+      extra: {'album': album},
+    );
+  }
+
+  void _onPlaylistTap(LibraryItem playlist) {
+    if (isLikedSongsId(playlist.id)) {
+      context.pushNamed(branchAwareName(context, Routes.favouriteSongs));
+      return;
+    }
+    if (isOnRepeatId(playlist.id)) {
+      context.pushNamed(branchAwareName(context, Routes.onRepeat));
+      return;
+    }
+    ref.read(currentPlaylistProvider.notifier).setPlaylist(playlist);
+    context.pushNamed(
+      branchAwareName(context, Routes.playlist),
+      extra: {'playlist': playlist},
+    );
+  }
+
+  Future<void> _onPlayAlbum(LibraryItem album) => _play(
+    album,
+    () => ref.read(setPlaybackProvider.notifier).playAlbum(album),
+  );
+
+  Future<void> _onPlayPlaylist(LibraryItem playlist) => _play(
+    playlist,
+    () => isLikedSongsId(playlist.id)
+        ? ref.read(setPlaybackProvider.notifier).playFavouriteSongs(playlist)
+        : ref.read(setPlaybackProvider.notifier).playPlaylist(playlist),
+  );
+
+  Future<void> _play(
+    LibraryItem item,
+    Future<SetPlaybackResult> Function() action,
+  ) async {
+    final result = await action();
+    if (result == SetPlaybackResult.empty && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Nothing to play in "${item.name}"')),
+      );
+    }
+  }
+
+  void _onGeneratedPlaylistTap(LibraryItem playlist) => context.pushNamed(
+    Routes.homeGeneratedPlaylist.name,
+    extra: {'playlist': playlist},
+  );
+
+  Future<void> _onPlayGeneratedPlaylist(LibraryItem playlist) => _play(
+    playlist,
+    () =>
+        ref.read(setPlaybackProvider.notifier).playGeneratedPlaylist(playlist),
+  );
+
+  Widget? _generatedPlaylistCover(LibraryItem playlist) {
+    final playlists = ref.watch(todaysPlaylistsProvider).valueOrNull;
+    final songs = playlists
+        ?.firstWhereOrNull((candidate) => candidate.item.id == playlist.id)
+        ?.coverSongs;
+    if (songs == null || songs.isEmpty) return null;
+
+    final imageService = ref.read(imageServiceProvider);
+    return CoverMosaic(
+      images: [for (final song in songs) imageService.itemImage(song)],
+    );
+  }
+
+  Widget _regenerateButton() => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      IconButton(
+        onPressed: () => unawaited(
+          ref.read(todaysPlaylistsProvider.notifier).forgetToday(),
+        ),
+        icon: const Icon(Icons.delete_outline),
+        iconSize: 20,
+        tooltip: 'Forget mixes, restart to re-sync (debug)',
+        color: Theme.of(context).colorScheme.onPrimary,
+      ),
+      IconButton(
+        onPressed: () =>
+            unawaited(ref.read(todaysPlaylistsProvider.notifier).regenerate()),
+        icon: const Icon(Icons.refresh),
+        iconSize: 20,
+        tooltip: 'Rebuild mixes (debug)',
+        color: Theme.of(context).colorScheme.onPrimary,
+      ),
+    ],
+  );
+
+  Widget _playlistSortButton() {
+    final sort = ref.watch(homePlaylistSortProvider);
+    return AppDropdown<EntityFilter>(
+      icon: Icons.sort,
+      iconSize: _device.isDesktop ? 20 : null,
+      value: sort.orderBy,
+      onChanged: (value) => ref
+          .read(appSettingsProvider.notifier)
+          .setHomePlaylistSort(sort.select(value)),
+      entries: [
+        for (final value in ItemList.playlists.sortOptions())
+          AppDropdownEntry(
+            value: value,
+            label: value.label,
+            trailingBuilder: (color) => Icon(
+              sort.desc ? Icons.arrow_upward : Icons.arrow_downward,
+              color: color,
+            ),
+          ),
+      ],
+    );
+  }
+
+  void _onRecentlyPlayedTap(LibraryItem item) {
+    if (!isInstantMixId(item.id)) return _onAlbumTap(item);
+    ref.read(instantMixesProvider.notifier).touch(item.id);
+    unawaited(
+      context.pushNamed(Routes.homeInstantMix.name, extra: {'mix': item}),
+    );
+  }
+
+  Future<void> _onPlayRecentlyPlayed(LibraryItem item) async {
+    if (!isInstantMixId(item.id)) return _onPlayAlbum(item);
+    final mix = ref.read(instantMixesProvider.notifier).byId(item.id);
+    if (mix == null) return;
+    await ref.read(setPlaybackProvider.notifier).playInstantMix(mix);
+  }
+
+  Widget? _instantMixCover(LibraryItem item) {
+    if (!isInstantMixId(item.id)) return null;
+    final songs = ref
+        .watch(libraryInstantMixesProvider)
+        .firstWhereOrNull((mix) => mix.item.id == item.id)
+        ?.songs;
+    if (songs == null || songs.isEmpty) return null;
+
+    final imageService = ref.read(imageServiceProvider);
+    return CoverMosaic(
+      images: [
+        for (final song in songs.take(4)) imageService.itemImage(song),
+      ],
+    );
+  }
+
+  void _onResumeItemTap(LibraryItem item) {
+    switch (item.kind) {
+      case ItemKind.artist:
+        context.pushNamed(
+          branchAwareName(context, Routes.artist),
+          extra: {'artist': item},
+        );
+      case ItemKind.playlist when isInstantMixId(item.id):
+        _onRecentlyPlayedTap(item);
+      case ItemKind.playlist:
+        _onPlaylistTap(item);
+      case ItemKind.album ||
+          ItemKind.song ||
+          ItemKind.genre ||
+          ItemKind.library ||
+          ItemKind.unknown:
+        _onAlbumTap(item);
+    }
+  }
+
+  Future<void> _onResume(LibraryItem item) async {
+    final point = ref.read(resumePointProvider(item.id));
+    if (point == null) return;
+    await resumeSet(context, ref, point);
+  }
+
+  void _onFavouriteTap(LibraryItem item) =>
+      item.kind == ItemKind.playlist ? _onPlaylistTap(item) : _onAlbumTap(item);
+
+  Future<void> _onPlayFavourite(LibraryItem item) =>
+      item.kind == ItemKind.playlist
+      ? _onPlayPlaylist(item)
+      : _onPlayAlbum(item);
+
+  void _refreshFavourites() => ref
+    ..invalidate(favouriteAlbumsProvider)
+    ..invalidate(favouritePlaylistsProvider);
+
+  Future<void> _reloadFavourites() {
+    _refreshFavourites();
+    return ref.read(homeFavouritesProvider.future);
+  }
+
+  void _onFavouritesTap() =>
+      context.pushNamed(branchAwareName(context, Routes.favourites));
+
+  void _onPlaylistsTap() {
+    ref.read(browseViewRequestProvider.notifier).state = ItemList.playlists;
+    context.goNamed(Routes.browse.name);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_category != 0) {
+      return ScrollablePageScaffold(
+        useGradientBackground: true,
+        slivers: [
+          SliverToBoxAdapter(child: _categoryPicker()),
+          SliverToBoxAdapter(
+            child: SpokenAudioHub(
+              category: _category == 1
+                  ? SpokenCategory.podcasts
+                  : SpokenCategory.audiobooks,
+            ),
+          ),
+        ],
+      );
+    }
+    final isOffline = ref.watch(isOfflineProvider);
+    final resumePoints = ref.watch(jumpBackInProvider);
+    final serverPlaylists = ref.watch(homePlaylistsProvider);
+    final playlists =
+        (serverPlaylists.isLoading && serverPlaylists.hasValue
+                ? AsyncValue.data(serverPlaylists.requireValue)
+                : serverPlaylists)
+            .whenData(
+              (list) => [
+                ?ref.watch(likedSongsPlaylistProvider),
+                ?ref.watch(onRepeatCardProvider).valueOrNull,
+                ...list,
+              ],
+            );
+
+    return ScrollablePageScaffold(
+      useGradientBackground: true,
+      navigationBar: PreferredSize(
+        preferredSize: Size.fromHeight(_navigationBarHeight),
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: _horizontalPadding),
+          child: Row(
+            children: [
+              LibrarySelectorButton(
+                size: _device.isMobile ? 32 : 40,
+                showName: true,
+              ),
+              const Spacer(),
+              if (ref.watch(settingProvider(AppSetting.offlineModeToggle))) ...[
+                OfflineModeButton(iconSize: _device.isDesktop ? 24 : 28),
+                const SizedBox(width: 12),
+              ],
+              if (!_device.isDesktop &&
+                  ref.watch(settingProvider(AppSetting.pinsEnabled))) ...[
+                const PinnedItemsButton(),
+                const SizedBox(width: 12),
+              ],
+              UpdatifyBell(
+                isDesktop: _device.isDesktop,
+                iconSize: _device.isDesktop ? 24 : 28,
+              ),
+            ],
+          ),
+        ),
+      ),
+      contentPadding: const EdgeInsets.only(bottom: 30),
+      slivers: [
+        SliverToBoxAdapter(child: _categoryPicker()),
+        if (!isOffline) ...[
+          SliverToBoxAdapter(
+            child: SpeedDialSection(
+              items: ref.watch(speedDialItemsProvider),
+              horizontalPadding: _horizontalPadding,
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: ItemCarousel(
+              title: 'Your top songs',
+              items: ref.watch(speedDialSongsProvider),
+              device: _device,
+              horizontalPadding: _horizontalPadding,
+              onItemTap: (song) =>
+                  unawaited(ref.read(seedRadioProvider.notifier).start(song)),
+              onPlayPressed: ref.read(seedRadioProvider.notifier).start,
+              optionsBuilder: _setOptions,
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: ItemCarousel(
+              title: 'Forgotten favourites',
+              items: ref.watch(forgottenFavouritesProvider),
+              device: _device,
+              horizontalPadding: _horizontalPadding,
+              onItemTap: (song) =>
+                  unawaited(ref.read(seedRadioProvider.notifier).start(song)),
+              onPlayPressed: ref.read(seedRadioProvider.notifier).start,
+              optionsBuilder: _setOptions,
+            ),
+          ),
+        ],
+        if (isOffline)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: _horizontalPadding),
+              child: OfflineNotice(
+                message:
+                    "You're offline. Your library will be back "
+                    'once the server is reachable.',
+                showDownloadsLink: true,
+              ),
+            ),
+          )
+        else ...[
+          SliverToBoxAdapter(
+            child: ItemCarousel(
+              title: 'Recently added',
+              items: ref.watch(recentlyAddedAlbumsProvider),
+              device: _device,
+              horizontalPadding: _horizontalPadding,
+              onItemTap: _onAlbumTap,
+              onPlayPressed: _onPlayAlbum,
+              optionsBuilder: _cardOptions(recentlyAddedAlbumsProvider),
+              onRetry: () => ref.invalidate(recentlyAddedAlbumsProvider),
+              onRefresh: () => ref.refresh(recentlyAddedAlbumsProvider.future),
+            ),
+          ),
+          if (!ref.watch(settingProvider(AppSetting.recentReleasesHidden)))
+            SliverToBoxAdapter(
+              child: ReleaseCardStrip(
+                title: 'Recent releases',
+                items: ref.watch(recentReleasesProvider),
+                device: _device,
+                horizontalPadding: _horizontalPadding,
+                onItemTap: _onAlbumTap,
+                onPlayPressed: _onPlayAlbum,
+                optionsBuilder: _cardOptions(recentReleasesProvider),
+                onRetry: () => ref.invalidate(recentReleasesProvider),
+              ),
+            ),
+          if (!ref.watch(
+            settingProvider(AppSetting.generatedPlaylistsDisabled),
+          ))
+            SliverToBoxAdapter(
+              child: ItemCarousel(
+                title: 'Made for you',
+                items: ref.watch(todaysPlaylistItemsProvider),
+                device: _device,
+                horizontalPadding: _horizontalPadding,
+                onItemTap: _onGeneratedPlaylistTap,
+                onPlayPressed: _onPlayGeneratedPlaylist,
+                coverBuilder: _generatedPlaylistCover,
+                optionsBuilder: _setOptions,
+                onRetry: () => ref.invalidate(todaysPlaylistsProvider),
+                trailing: ref.watch(devToolsEnabledProvider)
+                    ? _regenerateButton()
+                    : null,
+              ),
+            ),
+          if (resumePoints.isNotEmpty)
+            SliverToBoxAdapter(
+              child: ItemCarousel(
+                title: 'Jump back in',
+                items: AsyncValue.data([
+                  for (final point in resumePoints) point.item,
+                ]),
+                device: _device,
+                horizontalPadding: _horizontalPadding,
+                onItemTap: _onResumeItemTap,
+                onPlayPressed: _onResume,
+                coverBuilder: _instantMixCover,
+                optionsBuilder: _setOptions,
+              ),
+            ),
+          if (!ref.watch(settingProvider(AppSetting.recentlyPlayedHidden)))
+            SliverToBoxAdapter(
+              child: ItemCarousel(
+                title: 'Recently played',
+                items: ref.watch(recentlyPlayedItemsProvider),
+                device: _device,
+                horizontalPadding: _horizontalPadding,
+                onItemTap: _onRecentlyPlayedTap,
+                onPlayPressed: _onPlayRecentlyPlayed,
+                coverBuilder: _instantMixCover,
+                optionsBuilder: _cardOptions(recentlyPlayedAlbumsProvider),
+                onRetry: () => ref.invalidate(recentlyPlayedAlbumsProvider),
+                onRefresh: () =>
+                    ref.refresh(recentlyPlayedAlbumsProvider.future),
+              ),
+            ),
+          if (!ref.watch(settingProvider(AppSetting.favouritesHidden)))
+            SliverToBoxAdapter(
+              child: ItemCarousel(
+                title: 'Favourites',
+                items: ref.watch(homeFavouritesProvider),
+                device: _device,
+                horizontalPadding: _horizontalPadding,
+                onItemTap: _onFavouriteTap,
+                onPlayPressed: _onPlayFavourite,
+                onTitleTap: _onFavouritesTap,
+                optionsBuilder: _cardOptions(homeFavouritesProvider),
+                onRetry: _refreshFavourites,
+                onRefresh: _reloadFavourites,
+              ),
+            ),
+          SliverToBoxAdapter(
+            child: ItemCarousel(
+              title: 'Playlists',
+              items: playlists,
+              onTitleTap: _onPlaylistsTap,
+              device: _device,
+              horizontalPadding: _horizontalPadding,
+              onItemTap: _onPlaylistTap,
+              onPlayPressed: _onPlayPlaylist,
+              optionsBuilder: _cardOptions(homePlaylistsProvider),
+              onRetry: () => ref.invalidate(homePlaylistsProvider),
+              onRefresh: () => ref.refresh(homePlaylistsProvider.future),
+              trailing: (playlists.valueOrNull?.isNotEmpty ?? false)
+                  ? _playlistSortButton()
+                  : null,
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: ItemCarousel(
+              title: 'Frequently played',
+              items: ref.watch(frequentlyPlayedAlbumsProvider),
+              device: _device,
+              horizontalPadding: _horizontalPadding,
+              onItemTap: _onAlbumTap,
+              onPlayPressed: _onPlayAlbum,
+              optionsBuilder: _cardOptions(frequentlyPlayedAlbumsProvider),
+              onRetry: () => ref.invalidate(frequentlyPlayedAlbumsProvider),
+              onRefresh: () =>
+                  ref.refresh(frequentlyPlayedAlbumsProvider.future),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}

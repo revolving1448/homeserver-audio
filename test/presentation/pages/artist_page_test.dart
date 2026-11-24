@@ -1,0 +1,208 @@
+import 'package:faker_dart/faker_dart.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:jplayer/src/data/backend/media_server_client.dart';
+import 'package:jplayer/src/data/backend/stream_source.dart';
+import 'package:jplayer/src/data/providers/media_server_client_provider.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/current_user_provider.dart';
+import 'package:jplayer/src/presentation/pages/artist_page.dart';
+import 'package:jplayer/src/presentation/widgets/widgets.dart';
+import 'package:jplayer/src/providers/base_url_provider.dart';
+import 'package:mocktail/mocktail.dart';
+
+import '../../app_wrapper.dart';
+import '../../provider_container.dart';
+import 'package:jplayer/src/data/backend/library_query.dart';
+
+class MockMediaServerClient extends Mock implements MediaServerClient {}
+
+class MockUser extends Mock implements User {}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late MediaServerClient mockMediaServerClient;
+  late User mockUser;
+
+  final faker = Faker.instance;
+  final mockBaseUrl = faker.internet.url();
+  final mockArtist = LibraryItem(
+    id: faker.datatype.uuid(),
+    name: faker.name.fullName(),
+    kind: ItemKind.artist,
+    albumArtist: faker.name.fullName(),
+    images: ImageRefs(primary: faker.datatype.uuid()),
+  );
+  final mockAlbums = LibraryPage(
+    items: List.generate(
+      5,
+      (_) => LibraryItem(
+        id: faker.datatype.uuid(),
+        name: faker.lorem.sentence(),
+        kind: ItemKind.album,
+        productionYear: faker.date.past(DateTime.now()).year,
+        albumArtist: faker.name.fullName(),
+      ),
+    ),
+    totalRecordCount: faker.datatype.number(),
+  );
+  final mockAppearsOn = LibraryPage(
+    items: List.generate(
+      5,
+      (_) => LibraryItem(
+        id: faker.datatype.uuid(),
+        name: faker.lorem.sentence(),
+        kind: ItemKind.album,
+        productionYear: faker.date.past(DateTime.now()).year,
+        albumArtist: faker.name.fullName(),
+      ),
+    ),
+    totalRecordCount: faker.datatype.number(),
+  );
+  final mockUserId = faker.datatype.uuid();
+
+  Widget getWidgetUT({required LibraryItem artist}) => createTestApp(
+    providerContainer: createProviderContainer(
+      overrides: [
+        mediaServerClientProvider.overrideWith((_) => mockMediaServerClient),
+        baseUrlProvider.overrideWith((_) => mockBaseUrl),
+        currentUserProvider.overrideWith((_) => mockUser),
+      ],
+    ),
+    home: ArtistPage(artist: artist),
+  );
+
+  Future<LibraryPage> mockGetAlbums({
+    String? contributingArtistIds,
+    List<String>? artistIds,
+  }) {
+    return mockMediaServerClient.getAlbums(
+      any(
+        that: predicate<LibraryQuery>((query) {
+          if (contributingArtistIds != null &&
+              query.appearsOnArtistId != contributingArtistIds) {
+            return false;
+          }
+          if (artistIds != null &&
+              query.artistIds.join(',') != artistIds.join(',')) {
+            return false;
+          }
+          return true;
+        }),
+      ),
+    );
+  }
+
+  setUpAll(() {
+    registerFallbackValue(ImageKind.primary);
+    registerFallbackValue(mockArtist);
+    registerFallbackValue(const LibraryQuery());
+  });
+
+  setUp(() {
+    mockMediaServerClient = MockMediaServerClient();
+    mockUser = MockUser();
+    when(
+      () => mockMediaServerClient.imageUri(
+        any(),
+        kind: any(named: 'kind'),
+        size: any(named: 'size'),
+      ),
+    ).thenReturn(Uri.parse('https://example.com/image.jpg'));
+    when(
+      () => mockGetAlbums(artistIds: [mockArtist.id]),
+    ).thenAnswer((_) async => mockAlbums);
+    when(
+      () => mockGetAlbums(contributingArtistIds: mockArtist.id),
+    ).thenAnswer((_) async => mockAppearsOn);
+    when(() => mockUser.userId).thenReturn(mockUserId);
+    when(
+      () => mockMediaServerClient.getItem(
+        mockArtist.id,
+        kind: ItemKind.artist,
+      ),
+    ).thenAnswer((_) async => mockArtist);
+  });
+
+  group('ArtistPage', () {
+    testWidgets(
+      '- displays artist details',
+      (widgetTester) async {
+        await widgetTester.pumpWidget(getWidgetUT(artist: mockArtist));
+        await widgetTester.pump(Duration.zero);
+        expect(find.text(mockArtist.name), findsAtLeastNWidgets(1));
+        expect(find.text('Read more'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      '- a long biography shows two lines and expands on Read more',
+      (widgetTester) async {
+        final bio = List.filled(20, 'Formed in a garage.').join(' ');
+        final artist = mockArtist.copyWith(overview: bio);
+        await widgetTester.pumpWidget(getWidgetUT(artist: artist));
+        await widgetTester.pump(Duration.zero);
+        expect(find.text(bio), findsOneWidget);
+        expect(find.byType(SelectableText), findsNothing);
+
+        await widgetTester.tap(find.text('Read more'));
+        await widgetTester.pump();
+
+        expect(find.byType(SelectableText), findsOneWidget);
+        expect(find.text('Read less'), findsOneWidget);
+
+        await widgetTester.tap(find.text('Read less'));
+        await widgetTester.pump();
+
+        expect(find.byType(SelectableText), findsNothing);
+        expect(find.text('Read more'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      '- displays list of albums',
+      (widgetTester) async {
+        when(
+          () => mockGetAlbums(contributingArtistIds: mockArtist.id),
+        ).thenAnswer((_) async => mockAppearsOn.copyWith(items: const []));
+        await widgetTester.pumpWidget(getWidgetUT(artist: mockArtist));
+        await widgetTester.pump(Duration.zero);
+        await widgetTester.scrollUntilVisible(find.text('Albums'), 200);
+        await widgetTester.pump();
+        final albumUT = mockAlbums.items.first;
+        final albumFinder = find.byType(AlbumView);
+        expect(albumFinder, findsWidgets);
+        expect(
+          find.descendant(of: albumFinder, matching: find.text(albumUT.name)),
+          findsOneWidget,
+        );
+        expect(find.text('Newest release'), findsNothing);
+        expect(find.text('Albums'), findsOneWidget);
+        expect(find.text('Appears On'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      '- displays list of appears on',
+      (widgetTester) async {
+        when(
+          () => mockGetAlbums(artistIds: [mockArtist.id]),
+        ).thenAnswer((_) async => mockAlbums.copyWith(items: const []));
+        await widgetTester.pumpWidget(getWidgetUT(artist: mockArtist));
+        await widgetTester.pump(Duration.zero);
+        await widgetTester.scrollUntilVisible(find.text('Appears On'), 200);
+        await widgetTester.pump();
+        final albumUT = mockAppearsOn.items.first;
+        final albumFinder = find.byType(AlbumView);
+        expect(albumFinder, findsWidgets);
+        expect(
+          find.descendant(of: albumFinder, matching: find.text(albumUT.name)),
+          findsOneWidget,
+        );
+        expect(find.text('Appears On'), findsOneWidget);
+        expect(find.text('Albums'), findsNothing);
+      },
+    );
+  });
+}

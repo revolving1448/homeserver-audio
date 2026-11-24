@@ -1,0 +1,783 @@
+import 'dart:async';
+import 'dart:developer' as dev;
+import 'dart:math';
+import 'dart:ui' as ui;
+
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/resources/entypo_icons.dart';
+import 'package:jplayer/resources/resources.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/providers/image_service_provider.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/presentation/utils/studio_stage_layout.dart';
+import 'package:jplayer/src/presentation/widgets/animated_cover_video.dart';
+import 'package:jplayer/src/presentation/widgets/aurora_background.dart';
+import 'package:jplayer/src/presentation/widgets/desktop_window_chrome.dart';
+import 'package:jplayer/src/presentation/widgets/flip_panel.dart';
+import 'package:jplayer/src/presentation/widgets/hover_icon_button.dart';
+import 'package:jplayer/src/presentation/widgets/lyrics_overlay.dart';
+import 'package:jplayer/src/presentation/widgets/play_pause_button.dart';
+import 'package:jplayer/src/presentation/widgets/position_labels.dart';
+import 'package:jplayer/src/presentation/widgets/position_slider.dart';
+import 'package:jplayer/src/presentation/widgets/studio_clock.dart';
+import 'package:jplayer/src/core/shaders/shaders.dart';
+import 'package:jplayer/src/domain/providers/shader_config_provider.dart';
+import 'package:jplayer/src/presentation/widgets/fluid_background.dart';
+import 'package:jplayer/src/presentation/widgets/keep_screen_awake.dart';
+import 'package:jplayer/src/presentation/widgets/studio_tuning_panel.dart';
+import 'package:jplayer/src/providers/color_scheme_provider.dart';
+import 'package:just_audio_background/just_audio_background.dart';
+import 'package:window_manager/window_manager.dart';
+
+class StudioMode extends ConsumerWidget {
+  const StudioMode({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    ref.listen<bool>(
+      playbackProvider.select(
+        (state) => state.status == PlaybackStatus.stopped,
+      ),
+      (_, stopped) {
+        if (stopped) {
+          ref.read(studioModeVisibleProvider.notifier).state = false;
+        }
+      },
+    );
+    final isShown = ref.watch(studioModeShownProvider);
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 250),
+      child: isShown
+          ? const _StudioModeView(key: ValueKey(true))
+          : const SizedBox.expand(key: ValueKey(false)),
+    );
+  }
+}
+
+class _StudioModeView extends ConsumerStatefulWidget {
+  const _StudioModeView({super.key});
+
+  @override
+  ConsumerState<_StudioModeView> createState() => _StudioModeViewState();
+}
+
+class _StudioModeViewState extends ConsumerState<_StudioModeView> {
+  static const _splitDuration = Duration(milliseconds: 450);
+  static const Curve _splitCurve = Curves.easeInOutCubic;
+  final _isPlaying = ValueNotifier<bool>(false);
+  final _pointer = ValueNotifier<Offset?>(null);
+  late final StudioClock _clock;
+  MediaItem? _currentSong;
+  String? _displayedSongId;
+  String? _pendingSongId;
+  Uri? _readyVideoUrl;
+  ImageProvider _coverImage = const AssetImage(Images.album);
+  ui.FragmentShader? _auroraShader;
+  ui.Image? _blurredArt;
+  Timer? _hideTimer;
+  bool _controlsVisible = true;
+  bool _lyricsMounted = false;
+  int _activePointers = 0;
+  bool _didEnterWindowFullscreen = false;
+  double _controlsHeight = 190;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_enterWindowFullscreen());
+    final playing = ref.read(playbackProvider).status == PlaybackStatus.playing;
+    _isPlaying.value = playing;
+    _clock = StudioClock(playing: playing);
+    _applyAnimationSpeed(ref.read(animationSpeedProvider));
+    ref.listenManual(
+      animationSpeedProvider,
+      (_, speed) => _applyAnimationSpeed(speed),
+    );
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
+    ref.listenManual(nowPlayingProvider, (_, song) => _onNowPlaying(song));
+    _currentSong = ref.read(nowPlayingProvider);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _prepareArtwork(_currentSong);
+    });
+    ref.listenManual(
+      playbackProvider.select(
+        (state) => state.status == PlaybackStatus.playing,
+      ),
+      (_, playing) {
+        _isPlaying.value = playing;
+        _clock.isPlaying = playing;
+      },
+    );
+    _pokeControls();
+  }
+
+  Future<void> _enterWindowFullscreen() async {
+    if (!supportsWindowFullscreen) return;
+    if (!ref.read(settingProvider(AppSetting.studioModeFullscreen))) return;
+    if (await windowManager.isFullScreen()) return;
+    _didEnterWindowFullscreen = true;
+    await windowManager.setMinimumSize(Size.zero);
+    await windowManager.setFullScreen(true);
+  }
+
+  void _onNowPlaying(MediaItem? song) {
+    if (!mounted) return;
+    if (song?.id != _currentSong?.id) {
+      final albumChanged =
+          song?.album != _currentSong?.album ||
+          song?.artist != _currentSong?.artist;
+      setState(() {
+        _currentSong = song;
+        if (albumChanged) _readyVideoUrl = null;
+      });
+    }
+    if (song?.id == _displayedSongId && _auroraShader != null) return;
+    _prepareArtwork(song);
+  }
+
+  void _prepareArtwork(MediaItem? song) {
+    final id = song?.id;
+    _pendingSongId = id;
+    final imageService = ref.read(imageServiceProvider);
+    final cover = imageService.artworkImage(song?.artUri, size: 1024);
+    final background = imageService.artworkImage(song?.artUri);
+    unawaited(() async {
+      await precacheImage(cover, context);
+      ui.FragmentShader? shader;
+      ui.Image? blurred;
+      try {
+        final program = await auroraProgram();
+        blurred = await blurArtwork(background);
+        shader = program.fragmentShader()..setImageSampler(0, blurred);
+      } on Object catch (error) {
+        dev.log('Failed to build aurora shader', error: error);
+        shader?.dispose();
+        blurred?.dispose();
+        shader = null;
+        blurred = null;
+      }
+      if (!mounted || _pendingSongId != id) {
+        shader?.dispose();
+        blurred?.dispose();
+        return;
+      }
+      final outgoingShader = _auroraShader;
+      final outgoingArt = _blurredArt;
+      setState(() {
+        _displayedSongId = id;
+        _coverImage = cover;
+        _auroraShader = shader;
+        _blurredArt = blurred;
+      });
+      Timer(const Duration(milliseconds: 900), () {
+        outgoingShader?.dispose();
+        outgoingArt?.dispose();
+      });
+    }());
+  }
+
+  void _applyAnimationSpeed(AnimationSpeed speed) =>
+      _clock.run(animate: speed.isAnimated, speedScale: speed.multiplier);
+
+  void _pokeControls() {
+    _hideTimer?.cancel();
+    if (!_controlsVisible) setState(() => _controlsVisible = true);
+    _hideTimer = Timer(const Duration(seconds: 5), _hideControls);
+  }
+
+  void _hideControls() {
+    if (ref.read(settingProvider(AppSetting.studioModePinnedControls))) return;
+    if (_activePointers > 0) {
+      _hideTimer = Timer(const Duration(seconds: 5), _hideControls);
+      return;
+    }
+    if (mounted) setState(() => _controlsVisible = false);
+  }
+
+  void _onPointerDown(PointerDownEvent event) {
+    _activePointers++;
+    _pokeControls();
+  }
+
+  void _onPointerUp(PointerUpEvent event) {
+    _activePointers = max(0, _activePointers - 1);
+    if (event.kind != PointerDeviceKind.mouse) _pointer.value = null;
+    _pokeControls();
+  }
+
+  void _onPointerCancel(PointerCancelEvent event) {
+    _activePointers = max(0, _activePointers - 1);
+    if (event.kind != PointerDeviceKind.mouse) _pointer.value = null;
+    _pokeControls();
+  }
+
+  ShaderConfig? get _tunableShader =>
+      studioShaderFor(ref.watch(studioBackgroundProvider));
+
+  bool get _hasTuning => _tunableShader != null;
+
+  void _toggleTuning() {
+    final panel = ref.read(studioTuningPanelProvider.notifier);
+    panel.state = !panel.state;
+  }
+
+  void _toggleLyrics() => ref
+      .read(appSettingsProvider.notifier)
+      .toggle(AppSetting.studioModeLyrics);
+
+  void _close() {
+    ref.read(studioModeVisibleProvider.notifier).state = false;
+  }
+
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.escape) return false;
+    _close();
+    return true;
+  }
+
+  Uri? _motionCover() => ref.watch(nowPlayingAnimatedCoverProvider).valueOrNull;
+
+  void _onVideoReady(Uri url) {
+    if (!mounted || _readyVideoUrl == url) return;
+    setState(() => _readyVideoUrl = url);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final motionCover = _motionCover();
+    final videoShown = motionCover != null && motionCover == _readyVideoUrl;
+    final coverOverVideo = ref.watch(
+      settingProvider(AppSetting.studioModeCoverOverVideo),
+    );
+    final placement = ref.watch(studioLyricsPlacementProvider);
+    return Material(
+      type: MaterialType.transparency,
+      child: Focus(
+        autofocus: true,
+        child: MouseRegion(
+          onHover: (event) {
+            _pointer.value = event.localPosition;
+            _pokeControls();
+          },
+          onExit: (_) => _pointer.value = null,
+          cursor: _controlsVisible
+              ? MouseCursor.defer
+              : SystemMouseCursors.none,
+          child: Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: _onPointerDown,
+            onPointerMove: (event) {
+              _pointer.value = event.localPosition;
+              _pokeControls();
+            },
+            onPointerUp: _onPointerUp,
+            onPointerCancel: _onPointerCancel,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                const ColoredBox(color: Colors.black),
+                if (supportsKeepScreenOn) const KeepScreenAwake(),
+                switch (ref.watch(studioBackgroundProvider)) {
+                  StudioBackground.fluid => FluidBackground(
+                    animate: ref.watch(animationSpeedProvider).isAnimated,
+                    pointer: _pointer,
+                  ),
+                  StudioBackground.aurora => AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 800),
+                    child: KeyedSubtree(
+                      key: ValueKey(_displayedSongId),
+                      child: _animatedBackground(),
+                    ),
+                  ),
+                },
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 800),
+                  child: motionCover == null
+                      ? const SizedBox.expand(key: ValueKey(false))
+                      : KeyedSubtree(
+                          key: const ValueKey(true),
+                          child: _motionBackground(
+                            motionCover,
+                            active: videoShown,
+                          ),
+                        ),
+                ),
+                RepaintBoundary(
+                  child: SafeArea(
+                    child: placement == StudioLyricsPlacement.separate
+                        ? FlipPanel(
+                            side: ref.watch(studioModeLyricsProvider)
+                                ? FlipSide.left
+                                : FlipSide.front,
+                            front: _stageFace(
+                              videoShown: videoShown,
+                              coverOverVideo: coverOverVideo,
+                              lyricsShown: false,
+                            ),
+                            left: _lyricsFace(),
+                          )
+                        : LayoutBuilder(
+                            builder: (context, constraints) {
+                              final lyricsShown = ref.watch(
+                                studioModeLyricsProvider,
+                              );
+                              if (lyricsShown) _lyricsMounted = true;
+                              final onLeft =
+                                  placement == StudioLyricsPlacement.left;
+                              final lyricsWidth = constraints.maxWidth / 2;
+                              return Stack(
+                                children: [
+                                  AnimatedPositioned(
+                                    duration: _splitDuration,
+                                    curve: _splitCurve,
+                                    top: 0,
+                                    bottom: 0,
+                                    left: lyricsShown && onLeft
+                                        ? lyricsWidth
+                                        : 0,
+                                    width: lyricsShown
+                                        ? constraints.maxWidth - lyricsWidth
+                                        : constraints.maxWidth,
+                                    child: _stageFace(
+                                      videoShown: videoShown,
+                                      coverOverVideo: coverOverVideo,
+                                      lyricsShown: lyricsShown,
+                                    ),
+                                  ),
+                                  AnimatedPositioned(
+                                    duration: _splitDuration,
+                                    curve: _splitCurve,
+                                    top: 0,
+                                    bottom: 0,
+                                    left: onLeft
+                                        ? (lyricsShown ? 0 : -lyricsWidth)
+                                        : (lyricsShown
+                                              ? constraints.maxWidth -
+                                                    lyricsWidth
+                                              : constraints.maxWidth),
+                                    width: lyricsWidth,
+                                    onEnd: () {
+                                      if (!ref.read(
+                                            studioModeLyricsProvider,
+                                          ) &&
+                                          mounted) {
+                                        setState(
+                                          () => _lyricsMounted = false,
+                                        );
+                                      }
+                                    },
+                                    child: AnimatedOpacity(
+                                      opacity: lyricsShown ? 1 : 0,
+                                      duration: _splitDuration,
+                                      child: _lyricsMounted
+                                          ? _lyricsFace(
+                                              scrimFrom: onLeft
+                                                  ? Alignment.centerRight
+                                                  : Alignment.centerLeft,
+                                            )
+                                          : const SizedBox.shrink(),
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
+                          ),
+                  ),
+                ),
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: WindowDragStrip(
+                    onDragStart: () => _activePointers = 0,
+                  ),
+                ),
+                Positioned(
+                  top: 16,
+                  right: 16,
+                  child: _fadeWithControls(
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (_hasTuning) ...[
+                          HoverIconButton(
+                            onPressed: _toggleTuning,
+                            color: Colors.white,
+                            iconSize: 24,
+                            tooltip: 'Flow tuning',
+                            isSelected: ref.watch(studioTuningPanelProvider),
+                            icon: const Icon(Icons.tune),
+                          ),
+                          const SizedBox(width: 4),
+                        ],
+                        _lyricsButton(),
+                        const SizedBox(width: 4),
+                        HoverIconButton(
+                          onPressed: _close,
+                          color: Colors.white,
+                          iconSize: 24,
+                          tooltip: 'Exit studio mode',
+                          icon: const Icon(Icons.fullscreen_exit),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (_tunableShader case final shader?
+                    when ref.watch(studioTuningPanelProvider))
+                  Positioned(
+                    top: 48,
+                    left: 16,
+                    child: StudioTuningPanel(shader: shader),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _stageFace({
+    required bool videoShown,
+    required bool coverOverVideo,
+    required bool lyricsShown,
+  }) => AnimatedSwitcher(
+    duration: const Duration(milliseconds: 500),
+    child: videoShown && !coverOverVideo && !lyricsShown
+        ? KeyedSubtree(
+            key: const ValueKey(true),
+            child: _motionFace(),
+          )
+        : KeyedSubtree(
+            key: const ValueKey(false),
+            child: _nowPlayingFace(),
+          ),
+  );
+
+  void _onControlsHeight(double height) {
+    if (!mounted || height == _controlsHeight) return;
+    setState(() => _controlsHeight = height);
+  }
+
+  Widget _nowPlayingFace() => LayoutBuilder(
+    builder: (context, constraints) {
+      final layout = StudioStageLayout.of(
+        constraints.biggest,
+        controlsHeight: _controlsHeight,
+      );
+      final controls = SizedBox(
+        width: layout.controlsWidth,
+        child: _fadeWithControls(
+          _HeightReporter(onHeight: _onControlsHeight, child: _controls()),
+        ),
+      );
+      return switch (layout.mode) {
+        StudioStageMode.stacked => Stack(
+          children: [
+            Center(child: _centeredCover(layout.coverSize)),
+            Positioned(
+              top:
+                  (constraints.maxHeight + layout.coverSize) / 2 +
+                  StudioStageLayout.gap,
+              left: 0,
+              right: 0,
+              child: Center(child: controls),
+            ),
+          ],
+        ),
+        StudioStageMode.sideBySide => Center(
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _centeredCover(layout.coverSize),
+              const SizedBox(width: StudioStageLayout.sideGap),
+              controls,
+            ],
+          ),
+        ),
+      };
+    },
+  );
+
+  Widget _motionBackground(Uri url, {required bool active}) {
+    final lyricsShown = active && ref.watch(studioModeLyricsProvider);
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        AnimatedCoverVideo(url: url, onReady: _onVideoReady),
+        ClipRect(
+          child: TweenAnimationBuilder<double>(
+            tween: Tween(end: lyricsShown ? 10.0 : 0.0),
+            duration: const Duration(milliseconds: 400),
+            builder: (context, sigma, child) => BackdropFilter(
+              enabled: sigma > 0.1,
+              filter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+              child: const SizedBox.expand(),
+            ),
+          ),
+        ),
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          color: !active
+              ? Colors.transparent
+              : lyricsShown
+              ? Colors.black54
+              : Colors.black26,
+        ),
+        AnimatedOpacity(
+          opacity: active && _controlsVisible && !lyricsShown ? 1 : 0,
+          duration: const Duration(milliseconds: 200),
+          child: const DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Colors.black45,
+                  Colors.transparent,
+                  Colors.transparent,
+                  Colors.black87,
+                ],
+                stops: [0, 0.22, 0.55, 1],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _motionFace() => Align(
+    alignment: Alignment.bottomCenter,
+    child: _fadeWithControls(
+      ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 0, 24, 40),
+          child: _controls(),
+        ),
+      ),
+    ),
+  );
+
+  Widget _lyricsFace({Alignment? scrimFrom}) {
+    const lyrics = LyricsView(
+      padding: EdgeInsets.symmetric(horizontal: 48, vertical: 72),
+    );
+    if (ref.watch(studioBackgroundProvider) == StudioBackground.aurora) {
+      return lyrics;
+    }
+    final scrim = Colors.black.withValues(alpha: 0.55);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: scrimFrom == null ? scrim : null,
+        gradient: scrimFrom == null
+            ? null
+            : LinearGradient(
+                begin: scrimFrom,
+                end: Alignment(-scrimFrom.x, -scrimFrom.y),
+                colors: [Colors.transparent, scrim, scrim],
+                stops: const [0, 0.18, 1],
+              ),
+      ),
+      child: lyrics,
+    );
+  }
+
+  Widget _lyricsButton() => Consumer(
+    builder: (context, ref, _) {
+      final hasLyrics = ref.watch(currentSongHasLyricsProvider);
+      final showLyrics = ref.watch(studioModeLyricsProvider);
+      final isLookingUp = ref.watch(lyricsLookupPendingProvider);
+      return HoverIconButton(
+        onPressed: hasLyrics || showLyrics ? _toggleLyrics : null,
+        color: Colors.white,
+        disabledColor: Colors.white.withValues(alpha: 0.3),
+        iconSize: 24,
+        tooltip: switch ((hasLyrics, showLyrics)) {
+          (_, true) => 'Hide lyrics',
+          (true, false) => 'Lyrics',
+          (false, false) when isLookingUp => 'Looking for lyrics',
+          (false, false) => 'No lyrics for this track',
+        },
+        icon: isLookingUp
+            ? const LyricsLookupIndicator(icon: Icon(Icons.lyrics_outlined))
+            : const Icon(Icons.lyrics_outlined),
+        selectedIcon: isLookingUp
+            ? const LyricsLookupIndicator(icon: Icon(Icons.lyrics))
+            : const Icon(Icons.lyrics),
+        isSelected: showLyrics,
+      );
+    },
+  );
+
+  Widget _animatedBackground() {
+    final shader = _auroraShader;
+    if (shader == null) return const SizedBox.expand();
+    return SizedBox.expand(
+      child: RepaintBoundary(
+        child: CustomPaint(
+          painter: AuroraPainter(shader: shader, clock: _clock),
+        ),
+      ),
+    );
+  }
+
+  Widget _centeredCover(double size) => AnimatedSwitcher(
+    duration: const Duration(milliseconds: 500),
+    child: ClipRRect(
+      key: ValueKey(_displayedSongId),
+      borderRadius: BorderRadius.circular(16),
+      child: SizedBox.square(
+        dimension: size,
+        child: Image(
+          image: _coverImage,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) =>
+              Image.asset(Images.album, fit: BoxFit.cover),
+        ),
+      ),
+    ),
+  );
+
+  Widget _fadeWithControls(Widget child) => AnimatedOpacity(
+    opacity: _controlsVisible ? 1 : 0,
+    duration: const Duration(milliseconds: 200),
+    child: IgnorePointer(ignoring: !_controlsVisible, child: child),
+  );
+
+  Widget _controls() {
+    final artworkScheme = ref.watch(artworkSchemeProvider).valueOrNull;
+    return Theme(
+      data: Theme.of(context).copyWith(colorScheme: artworkScheme),
+      child: _controlsColumn(),
+    );
+  }
+
+  Widget _controlsColumn() => Column(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      Text(
+        _currentSong?.title ?? '',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.center,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 20,
+          fontWeight: FontWeight.w700,
+          height: 1.2,
+        ),
+      ),
+      const SizedBox(height: 2),
+      Text(
+        _currentSong?.artist ?? '',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: Colors.white.withOpacity(0.6),
+          fontSize: 14,
+          height: 1.2,
+        ),
+      ),
+      const SizedBox(height: 8),
+      const PositionSlider(),
+      const PositionLabels(fontSize: 12),
+      const SizedBox(height: 8),
+      IconTheme.merge(
+        data: const IconThemeData(size: 28),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            HoverIconButton(
+              onPressed: ref.read(playbackProvider.notifier).prev,
+              color: Colors.white,
+              iconSize: 28,
+              icon: const Icon(Entypo.fast_backward),
+            ),
+            const SizedBox(width: 16),
+            SizedBox.square(
+              dimension: 52,
+              child: PlayPauseButton(
+                onPressed: () => _isPlaying.value
+                    ? ref.read(playbackProvider.notifier).pause()
+                    : ref.read(playbackProvider.notifier).resume(),
+                background: Colors.white,
+                foreground: Colors.black,
+                stateNotifier: _isPlaying,
+              ),
+            ),
+            const SizedBox(width: 16),
+            HoverIconButton(
+              onPressed: ref.read(playbackProvider.notifier).next,
+              color: Colors.white,
+              iconSize: 28,
+              icon: const Icon(Entypo.fast_forward),
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    if (_didEnterWindowFullscreen) {
+      unawaited(
+        windowManager
+            .setFullScreen(false)
+            .then(
+              (_) => windowManager.setMinimumSize(minWindowSize),
+            ),
+      );
+    }
+    _hideTimer?.cancel();
+    _clock.dispose();
+    _pointer.dispose();
+    _auroraShader?.dispose();
+    _blurredArt?.dispose();
+    _isPlaying.dispose();
+    super.dispose();
+  }
+}
+
+class _HeightReporter extends SingleChildRenderObjectWidget {
+  const _HeightReporter({required this.onHeight, required super.child});
+
+  final ValueChanged<double> onHeight;
+
+  @override
+  RenderObject createRenderObject(BuildContext context) =>
+      _RenderHeightReporter(onHeight);
+
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _RenderHeightReporter renderObject,
+  ) => renderObject.onHeight = onHeight;
+}
+
+class _RenderHeightReporter extends RenderProxyBox {
+  _RenderHeightReporter(this.onHeight);
+
+  ValueChanged<double> onHeight;
+  double? _reported;
+
+  @override
+  void performLayout() {
+    super.performLayout();
+    final height = size.height;
+    if (height == _reported) return;
+    _reported = height;
+    WidgetsBinding.instance.addPostFrameCallback((_) => onHeight(height));
+  }
+}

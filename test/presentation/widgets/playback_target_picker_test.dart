@@ -1,0 +1,1365 @@
+import 'dart:async';
+import 'package:dio/dio.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:jplayer/src/core/upnp/av_transport.dart';
+import 'package:jplayer/src/core/upnp/upnp_device.dart';
+import 'package:jplayer/src/core/upnp/upnp_renderer.dart';
+import 'package:jplayer/src/core/upnp/upnp_soap_client.dart';
+import 'package:optional_features/jellybox_cloud.dart';
+import 'package:optional_features/upnp_quirks.dart';
+import 'package:jplayer/src/core/diagnostics/diagnostics.dart';
+import 'package:jplayer/src/domain/playback/control_point_host_provider.dart';
+import 'package:jplayer/src/domain/playback/output_controller.dart';
+import 'package:jplayer/src/domain/playback/playback_target.dart';
+import 'package:jplayer/src/domain/playback/playback_target_provider.dart';
+import 'package:flutter_chrome_cast/flutter_chrome_cast.dart';
+import 'package:jplayer/src/domain/providers/cast_devices_provider.dart';
+import 'package:jplayer/src/domain/providers/cloud_provider.dart';
+import 'package:jplayer/src/domain/providers/output_route_provider.dart';
+import 'package:jplayer/src/domain/providers/upnp_renderers_provider.dart';
+import 'package:jplayer/src/presentation/widgets/jellybox_cloud_connect_form.dart';
+import 'package:jplayer/src/presentation/widgets/playback_target_picker.dart';
+import 'package:jplayer/src/presentation/widgets/volume_control.dart';
+import 'package:jplayer/src/providers/diagnostics_provider.dart';
+import 'package:mocktail/mocktail.dart';
+import 'package:native_route_picker/native_route_picker.dart';
+
+class _FakeRenderersNotifier extends UpnpRenderersNotifier {
+  _FakeRenderersNotifier(List<UpnpRenderer> renderers)
+    : super(UpnpControlPoint(dio: Dio())) {
+    state = UpnpDiscoveryState(renderers: renderers);
+  }
+
+  @override
+  Future<void> refresh({Duration timeout = const Duration(seconds: 4)}) async {}
+}
+
+class _FakeOutputs implements OutputController {
+  final connected = Completer<void>();
+  PlaybackTarget? target;
+
+  @override
+  Future<void> playOn(PlaybackTarget target) {
+    this.target = target;
+    return connected.future;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _FakeCastNotifier extends CastDevicesNotifier {
+  _FakeCastNotifier(List<GoogleCastDevice> devices) {
+    state = CastDiscoveryState(devices: devices);
+  }
+
+  @override
+  void start() {}
+
+  @override
+  void stop() {}
+
+  @override
+  void refresh() {}
+}
+
+class _RecordingDiagnostics extends Diagnostics {
+  const _RecordingDiagnostics(this.reports);
+
+  final List<({String message, Map<String, Object?> data})> reports;
+
+  @override
+  Future<void> report(
+    String message, {
+    Map<String, Object?> data = const {},
+  }) async {
+    reports.add((message: message, data: data));
+  }
+}
+
+class _FakeQueue implements DeviceQueue {
+  @override
+  Future<void> load(
+    List<QueuedTrack> tracks, {
+    required int startIndex,
+    required bool autoPlay,
+  }) async {}
+
+  @override
+  Future<void> skipTo(int index) async {}
+
+  @override
+  Future<int?> currentIndex() async => 0;
+
+  @override
+  Future<void> clear() async {}
+}
+
+class _FakeTarget implements PlaybackTarget {
+  _FakeTarget(this.id, this.name, this.kind);
+
+  @override
+  final String id;
+  @override
+  final String name;
+  @override
+  final PlaybackTargetKind kind;
+
+  double? volume;
+
+  @override
+  Future<void> setVolume(double level) async => volume = level;
+
+  @override
+  TargetPlaybackState get state => TargetPlaybackState.idle;
+
+  @override
+  Stream<TargetPlaybackState> get stateStream => const Stream.empty();
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+void main() {
+  UpnpRenderer rendererNamed(
+    String name, {
+    String? model,
+    String? type,
+    String host = '10.0.0.9',
+    String? roomName,
+    String? manufacturer,
+    bool hasQueue = true,
+  }) {
+    final soap = UpnpSoapClient(dio: Dio());
+    final control = Uri.parse('http://$host:9197/ctl');
+    return UpnpRenderer(
+      device: UpnpDevice(
+        udn: 'uuid:$name-$host',
+        friendlyName: name,
+        deviceType: type ?? 'urn:schemas-upnp-org:device:MediaRenderer:1',
+        location: Uri.parse('http://$host:9197/desc.xml'),
+        services: const [],
+        modelName: model,
+        roomName: roomName,
+        manufacturer: manufacturer,
+      ),
+      avTransport: AvTransport(soap: soap, controlUrl: control),
+      sinkMimeTypes: const {'audio/mpeg'},
+      queueDriver: hasQueue ? _FakeQueue() : null,
+      fingerprint: DeviceFingerprint(
+        manufacturer: manufacturer,
+        modelName: model,
+        deviceType: type ?? 'urn:schemas-upnp-org:device:MediaRenderer:1',
+        friendlyName: name,
+        actions: {
+          'Play',
+          'Stop',
+          'SetAVTransportURI',
+          if (hasQueue) 'AddURIToQueue',
+        },
+        sinkMimeTypes: const {'audio/mpeg'},
+      ),
+    );
+  }
+
+  GoogleCastDevice castNamed(String name, {String? model, String? ip}) =>
+      GoogleCastDevice(
+        deviceID: 'cast-$name',
+        friendlyName: name,
+        modelName: model,
+        statusText: null,
+        deviceVersion: '1.0',
+        isOnLocalNetwork: true,
+        category: '',
+        uniqueID: 'cast-$name',
+        ipAddress: ip,
+      );
+
+  Future<void> pumpPicker(
+    WidgetTester tester, {
+    required List<UpnpRenderer> renderers,
+    List<GoogleCastDevice> castDevices = const [],
+    PlaybackTarget? activeTarget,
+    ControlPointHost host = ControlPointHost.sustained,
+    CloudState? cloud,
+    OutputRoute? route,
+    bool cloudAvailable = false,
+    VoidCallback? onDone,
+  }) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          cloudAvailableProvider.overrideWithValue(cloudAvailable),
+          currentOutputRouteProvider.overrideWith((ref) => Stream.value(route)),
+          upnpRenderersProvider.overrideWith(
+            (ref) => _FakeRenderersNotifier(renderers),
+          ),
+          castDevicesProvider.overrideWith(
+            (ref) => _FakeCastNotifier(castDevices),
+          ),
+          if (activeTarget != null)
+            playbackTargetProvider.overrideWith(
+              (ref) => PlaybackTargetNotifier(activeTarget),
+            ),
+          controlPointHostProvider.overrideWithValue(host),
+          if (cloud != null)
+            cloudProvider.overrideWith((ref) => _FakeCloudNotifier(cloud)),
+        ],
+        child: MaterialApp(
+          home: Scaffold(body: PlaybackTargetMenu(onDone: onDone ?? () {})),
+        ),
+      ),
+    );
+    await tester.pump();
+  }
+
+  const airPods = OutputRoute(
+    kind: OutputRouteKind.bluetooth,
+    name: 'AirPods Pro',
+  );
+
+  testWidgets(
+    '- ticks the AirPlay row, named, and hides this device when audio goes '
+    'to a system route',
+    (tester) async {
+      await pumpPicker(tester, renderers: const [], route: airPods);
+      await tester.pump();
+
+      ListTile tileOf(String title) => tester.widget<ListTile>(
+        find.ancestor(of: find.text(title), matching: find.byType(ListTile)),
+      );
+      expect(find.text('AirPods Pro'), findsOneWidget);
+      expect(tileOf('AirPlay & Bluetooth').trailing, isA<Icon>());
+      expect(find.text('This device'), findsNothing);
+      expect(find.byType(DeviceVolumeSlider), findsOneWidget);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+  );
+
+  testWidgets(
+    '- keeps this device ticked on its own speaker',
+    (tester) async {
+      await pumpPicker(
+        tester,
+        renderers: const [],
+        route: const OutputRoute(
+          kind: OutputRouteKind.builtIn,
+          name: 'Speaker',
+        ),
+      );
+      await tester.pump();
+
+      ListTile tileOf(String title) => tester.widget<ListTile>(
+        find.ancestor(of: find.text(title), matching: find.byType(ListTile)),
+      );
+      expect(tileOf('This device').trailing, isA<Icon>());
+      expect(tileOf('AirPlay & Bluetooth').trailing, isNull);
+      expect(find.text('Speaker'), findsNothing);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+  );
+
+  group('activeDeviceProvider', () {
+    ProviderContainer containerWith({
+      OutputRoute? route,
+      CloudState? cloud,
+    }) {
+      final container = ProviderContainer(
+        overrides: [
+          externalOutputRouteProvider.overrideWithValue(route),
+          playbackTargetProvider.overrideWith(
+            (ref) => PlaybackTargetNotifier(
+              _FakeTarget('local', 'This device', PlaybackTargetKind.local),
+            ),
+          ),
+          cloudProvider.overrideWith(
+            (ref) => _FakeCloudNotifier(cloud ?? const CloudState()),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      return container;
+    }
+
+    test('- names the system route this device plays through', () {
+      final device = containerWith(route: airPods).read(activeDeviceProvider);
+
+      expect(device?.name, 'AirPods Pro');
+      expect(device?.icon, Icons.bluetooth_audio);
+    });
+
+    test('- names nothing on the device\'s own speaker', () {
+      expect(containerWith().read(activeDeviceProvider), isNull);
+    });
+
+    test('- names the other device while one plays, over the route', () {
+      final device = containerWith(
+        route: airPods,
+        cloud: CloudState(
+          devices: const [
+            ConductorDevice(
+              id: 'mac',
+              name: 'MacBook',
+              platform: 'macos',
+              isRenderer: true,
+            ),
+          ],
+          remote: RemoteSession(
+            doc: const SessionDoc(itemIds: ['a']),
+            ageMs: 0,
+            receivedAt: DateTime(2026),
+          ),
+        ),
+      ).read(activeDeviceProvider);
+
+      expect(device?.name, 'MacBook');
+    });
+  });
+
+  group('continuity sign-in row', () {
+    testWidgets('- is offered while signed out', (tester) async {
+      await pumpPicker(
+        tester,
+        renderers: const [],
+        cloudAvailable: true,
+        cloud: const CloudState(),
+      );
+
+      expect(find.text('Continuity not available'), findsOneWidget);
+      expect(find.text('Tap to connect'), findsOneWidget);
+    });
+
+    testWidgets('- is gone once signed in', (tester) async {
+      await pumpPicker(
+        tester,
+        renderers: const [],
+        cloudAvailable: true,
+        cloud: const CloudState(
+          account: ContinuityAccount(
+            serverUrl: 'https://cloud.example',
+            email: 'alex@example.com',
+            userId: 'u',
+            token: 't',
+          ),
+        ),
+      );
+
+      expect(find.text('Continuity not available'), findsNothing);
+    });
+
+    testWidgets('- never shows in a build without continuity', (tester) async {
+      await pumpPicker(tester, renderers: const [], cloud: const CloudState());
+
+      expect(find.text('Continuity not available'), findsNothing);
+    });
+
+    testWidgets('- closes the menu and opens the sign-in form', (tester) async {
+      var closed = false;
+      await pumpPicker(
+        tester,
+        renderers: const [],
+        cloudAvailable: true,
+        cloud: const CloudState(),
+        onDone: () => closed = true,
+      );
+
+      await tester.tap(find.text('Continuity not available'));
+      await tester.pumpAndSettle();
+
+      expect(closed, isTrue);
+      expect(find.byType(JellyboxCloudConnectForm), findsOneWidget);
+    });
+  });
+
+  testWidgets('- lists this device and every renderer in one list', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      renderers: [
+        rendererNamed('[TV1476] ROOM 7005', model: 'HG55BU800EUXEN'),
+        rendererNamed('Kitchen', model: 'Sonos One'),
+      ],
+    );
+
+    expect(find.text('Play on'), findsOneWidget);
+    expect(find.text('This device'), findsOneWidget);
+    expect(find.text('[TV1476] ROOM 7005'), findsOneWidget);
+    expect(find.text('DLNA · HG55BU800EUXEN'), findsOneWidget);
+    expect(find.textContaining('10.0.0.9'), findsNothing);
+    expect(find.text('Kitchen'), findsOneWidget);
+    expect(find.text('No DLNA devices found on this network.'), findsNothing);
+  });
+
+  testWidgets('- gives each entry its own icon', (tester) async {
+    await pumpPicker(
+      tester,
+      renderers: [
+        rendererNamed('[TV1476] ROOM 7005', model: 'HG55BU800EUXEN'),
+        rendererNamed('Kitchen', model: 'Sonos One'),
+        rendererNamed('Hi-Fi', model: 'Denon AVR-X2700H'),
+      ],
+    );
+
+    expect(find.byIcon(Icons.tv), findsOneWidget);
+    expect(find.byIcon(Icons.speaker), findsOneWidget);
+    expect(find.byIcon(Icons.settings_input_component), findsOneWidget);
+    expect(
+      find.byIcon(Icons.laptop_mac).evaluate().length +
+          find.byIcon(Icons.phone_iphone).evaluate().length +
+          find.byIcon(Icons.smartphone).evaluate().length,
+      1,
+    );
+  });
+
+  testWidgets('- ticks the active renderer, not this device', (tester) async {
+    final renderer = rendererNamed('Kitchen', model: 'Sonos One');
+    await pumpPicker(
+      tester,
+      renderers: [renderer],
+      activeTarget: _FakeTarget(
+        renderer.id,
+        renderer.name,
+        PlaybackTargetKind.upnp,
+      ),
+    );
+
+    final ticked = tester.widget<ListTile>(
+      find.ancestor(of: find.text('Kitchen'), matching: find.byType(ListTile)),
+    );
+    expect(ticked.trailing, isA<Icon>());
+
+    final local = tester.widget<ListTile>(
+      find.ancestor(
+        of: find.text('This device'),
+        matching: find.byType(ListTile),
+      ),
+    );
+    expect(local.trailing, isNull);
+  });
+
+  testWidgets('- ticks the device playing via continuity, not this device', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      renderers: const [],
+      cloud: CloudState(
+        status: ConductorStatus.listening,
+        devices: const [
+          ConductorDevice(
+            id: 'mac',
+            name: 'MacBook',
+            platform: 'macos',
+            isRenderer: true,
+          ),
+        ],
+        remote: RemoteSession(
+          doc: const SessionDoc(itemIds: ['a']),
+          ageMs: 0,
+          receivedAt: DateTime(2026),
+        ),
+      ),
+    );
+
+    final ticked = tester.widget<ListTile>(
+      find.ancestor(of: find.text('MacBook'), matching: find.byType(ListTile)),
+    );
+    expect(ticked.trailing, isA<Icon>());
+
+    final local = tester.widget<ListTile>(
+      find.ancestor(
+        of: find.text('This device'),
+        matching: find.byType(ListTile),
+      ),
+    );
+    expect(local.trailing, isNull);
+  });
+
+  testWidgets('- ticks only the device playing, not a leftover speaker', (
+    tester,
+  ) async {
+    final kitchen = rendererNamed('Kitchen', model: 'Sonos One');
+    await pumpPicker(
+      tester,
+      renderers: [kitchen],
+      activeTarget: _FakeTarget(
+        kitchen.id,
+        kitchen.name,
+        PlaybackTargetKind.upnp,
+      ),
+      cloud: CloudState(
+        status: ConductorStatus.listening,
+        devices: const [
+          ConductorDevice(
+            id: 'mac',
+            name: 'MacBook',
+            platform: 'macos',
+            isRenderer: true,
+          ),
+        ],
+        remote: RemoteSession(
+          doc: const SessionDoc(itemIds: ['a']),
+          ageMs: 0,
+          receivedAt: DateTime(2026),
+        ),
+      ),
+    );
+
+    ListTile tileOf(String title) => tester.widget<ListTile>(
+      find.ancestor(of: find.text(title), matching: find.byType(ListTile)),
+    );
+    expect(tileOf('MacBook').trailing, isA<Icon>());
+    expect(tileOf('Kitchen').trailing, isNull);
+    expect(tileOf('This device').trailing, isNull);
+  });
+
+  testWidgets('- the volume slider sets the ticked renderer volume', (
+    tester,
+  ) async {
+    final kitchen = rendererNamed('Kitchen', model: 'Sonos One');
+    final lounge = rendererNamed('Lounge', host: '10.0.0.10');
+    final target = _FakeTarget(
+      kitchen.id,
+      kitchen.name,
+      PlaybackTargetKind.upnp,
+    );
+    await pumpPicker(
+      tester,
+      renderers: [kitchen, lounge],
+      activeTarget: target,
+    );
+
+    expect(find.byType(DeviceVolumeSlider), findsOneWidget);
+
+    await tester.drag(find.byType(Slider), const Offset(-400, 0));
+    await tester.pump();
+    expect(target.volume, 0);
+  });
+
+  testWidgets(
+    '- opens the system output picker from the AirPlay row',
+    (
+      tester,
+    ) async {
+      final calls = <MethodCall>[];
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('native_route_picker'),
+        (call) async {
+          calls.add(call);
+          return true;
+        },
+      );
+      addTearDown(
+        () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          const MethodChannel('native_route_picker'),
+          null,
+        ),
+      );
+      var closed = false;
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            upnpRenderersProvider.overrideWith(
+              (ref) => _FakeRenderersNotifier(const []),
+            ),
+            controlPointHostProvider.overrideWithValue(
+              ControlPointHost.sustained,
+            ),
+          ],
+          child: MaterialApp(
+            home: Scaffold(
+              body: PlaybackTargetMenu(onDone: () => closed = true),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      await tester.tap(find.text('AirPlay & Bluetooth'));
+      await tester.pump();
+
+      expect(closed, isTrue);
+      expect(calls.single.method, 'showOutputSwitcher');
+      expect(calls.single.arguments, containsPair('x', isA<double>()));
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.iOS),
+  );
+
+  testWidgets(
+    '- has no AirPlay row on Android',
+    (tester) async {
+      await pumpPicker(tester, renderers: const []);
+
+      expect(find.text('AirPlay & Bluetooth'), findsNothing);
+    },
+    variant: TargetPlatformVariant.only(TargetPlatform.android),
+  );
+
+  testWidgets('- switches the target when a renderer is tapped', (
+    tester,
+  ) async {
+    final renderer = rendererNamed('Kitchen', model: 'Sonos One');
+    final container = ProviderContainer(
+      overrides: [
+        upnpRenderersProvider.overrideWith(
+          (ref) => _FakeRenderersNotifier([renderer]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          home: Scaffold(body: PlaybackTargetMenu(onDone: () {})),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      container.read(playbackTargetProvider).kind,
+      PlaybackTargetKind.local,
+    );
+
+    await tester.tap(find.text('Kitchen'));
+    await tester.pump();
+
+    final target = container.read(playbackTargetProvider);
+    expect(target.kind, PlaybackTargetKind.upnp);
+    expect(target.id, renderer.id);
+    expect(target.name, 'Kitchen');
+  });
+
+  testWidgets('- plays on a Cast device when one is picked', (tester) async {
+    final container = ProviderContainer(
+      overrides: [
+        upnpRenderersProvider.overrideWith(
+          (ref) => _FakeRenderersNotifier(const []),
+        ),
+        castDevicesProvider.overrideWith(
+          (ref) => _FakeCastNotifier([castNamed('Kitchen', model: 'Nest')]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          home: Scaffold(body: PlaybackTargetMenu(onDone: () {})),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.text('Kitchen'));
+    await tester.pump();
+
+    final target = container.read(playbackTargetProvider);
+    expect(target.kind, PlaybackTargetKind.cast);
+    expect(target.id, 'cast:cast-Kitchen');
+    expect(target.name, 'Kitchen');
+  });
+
+  testWidgets('- spins on a Cast device until it is connected', (tester) async {
+    final outputs = _FakeOutputs();
+    var closed = false;
+    final container = ProviderContainer(
+      overrides: [
+        outputControllerProvider.overrideWithValue(outputs),
+        upnpRenderersProvider.overrideWith(
+          (ref) => _FakeRenderersNotifier(const []),
+        ),
+        castDevicesProvider.overrideWith(
+          (ref) => _FakeCastNotifier([castNamed('Kitchen', model: 'Nest')]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          home: Scaffold(
+            body: PlaybackTargetMenu(onDone: () => closed = true),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.text('Kitchen'));
+    await tester.pump();
+
+    final tile = find.ancestor(
+      of: find.text('Kitchen'),
+      matching: find.byType(ListTile),
+    );
+    expect(
+      find.descendant(
+        of: tile,
+        matching: find.byType(CircularProgressIndicator),
+      ),
+      findsOneWidget,
+    );
+    expect(closed, isFalse);
+    expect(outputs.target?.id, 'cast:cast-Kitchen');
+
+    container.read(playbackTargetProvider.notifier).select(outputs.target!);
+    outputs.connected.complete();
+    await tester.pump();
+
+    expect(closed, isTrue);
+  });
+
+  testWidgets('- stays open when the Cast device could not be reached', (
+    tester,
+  ) async {
+    final outputs = _FakeOutputs();
+    var closed = false;
+    final container = ProviderContainer(
+      overrides: [
+        outputControllerProvider.overrideWithValue(outputs),
+        upnpRenderersProvider.overrideWith(
+          (ref) => _FakeRenderersNotifier(const []),
+        ),
+        castDevicesProvider.overrideWith(
+          (ref) => _FakeCastNotifier([castNamed('Kitchen', model: 'Nest')]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          home: Scaffold(
+            body: PlaybackTargetMenu(onDone: () => closed = true),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.text('Kitchen'));
+    await tester.pump();
+    outputs.connected.complete();
+    await tester.pump();
+
+    expect(closed, isFalse);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    final tile = tester.widget<ListTile>(
+      find.ancestor(of: find.text('Kitchen'), matching: find.byType(ListTile)),
+    );
+    expect(tile.onTap, isNotNull);
+  });
+
+  testWidgets('- marks which protocol each device speaks', (tester) async {
+    await pumpPicker(
+      tester,
+      renderers: [rendererNamed('Lounge TV', model: 'QE85')],
+      castDevices: [castNamed('Kitchen', model: 'Nest Audio')],
+    );
+
+    Finder tile(String title) =>
+        find.ancestor(of: find.text(title), matching: find.byType(ListTile));
+
+    expect(
+      find.descendant(of: tile('Kitchen'), matching: find.byIcon(Icons.cast)),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: tile('Lounge TV'),
+        matching: find.byIcon(Icons.settings_input_antenna),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: tile('This device'),
+        matching: find.byIcon(Icons.settings_input_antenna),
+      ),
+      findsNothing,
+    );
+  });
+
+  testWidgets('- shows the address only when speakers share a name', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      renderers: [
+        rendererNamed('Sonos Play:5', model: 'Play:5', host: '10.0.0.11'),
+        rendererNamed('Sonos Play:5', model: 'Play:5', host: '10.0.0.12'),
+        rendererNamed(
+          'Sonos Play:5',
+          model: 'Play:5',
+          host: '10.0.0.13',
+          roomName: 'Office',
+        ),
+      ],
+    );
+
+    expect(find.text('Office'), findsOneWidget);
+    expect(find.text('Sonos Play:5'), findsNWidgets(2));
+    expect(find.text('DLNA · 10.0.0.11 · Play:5'), findsOneWidget);
+    expect(find.text('DLNA · 10.0.0.12 · Play:5'), findsOneWidget);
+    expect(find.text('DLNA · Play:5'), findsOneWidget);
+  });
+
+  group('sharing the device list', () {
+    late List<({String message, Map<String, Object?> data})> reports;
+
+    Future<void> pumpSharablePicker(WidgetTester tester) async {
+      reports = [];
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            upnpRenderersProvider.overrideWith(
+              (ref) => _FakeRenderersNotifier([
+                rendererNamed(
+                  "Alex's Bedroom",
+                  model: 'Play:5',
+                  host: '10.0.0.11',
+                  manufacturer: 'Sonos, Inc.',
+                ),
+              ]),
+            ),
+            diagnosticsProvider.overrideWithValue(
+              _RecordingDiagnostics(reports),
+            ),
+          ],
+          child: MaterialApp(
+            home: Scaffold(body: PlaybackTargetMenu(onDone: () {})),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    testWidgets('- offers an upload button once devices are found', (
+      tester,
+    ) async {
+      await pumpSharablePicker(tester);
+
+      final button = tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byIcon(Icons.upload),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(button.onPressed, isNotNull);
+    });
+
+    testWidgets('- shows the upload button disabled with nothing to share', (
+      tester,
+    ) async {
+      await pumpPicker(tester, renderers: const []);
+
+      expect(find.byIcon(Icons.upload), findsOneWidget);
+      final button = tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byIcon(Icons.upload),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(button.onPressed, isNull);
+    });
+
+    testWidgets('- sends nothing until the user confirms', (tester) async {
+      await pumpSharablePicker(tester);
+
+      await tester.tap(find.byIcon(Icons.upload));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Share what JellyBox found?'), findsOneWidget);
+      expect(reports, isEmpty);
+
+      await tester.tap(find.text('Not now'));
+      await tester.pumpAndSettle();
+
+      expect(reports, isEmpty);
+    });
+
+    testWidgets('- reports every device under one message on confirm', (
+      tester,
+    ) async {
+      await pumpSharablePicker(tester);
+
+      await tester.tap(find.byIcon(Icons.upload));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Share'));
+      await tester.pumpAndSettle();
+
+      expect(reports, hasLength(1));
+      expect(reports.single.message, 'upnp device report');
+
+      final devices = (reports.single.data['devices']! as List)
+          .cast<Map<String, Object?>>();
+      expect(devices, hasLength(1));
+      expect(devices.single['manufacturer'], 'Sonos, Inc.');
+      expect(devices.single['modelName'], 'Play:5');
+      expect(devices.single['hasFriendlyName'], isTrue);
+      expect(devices.single.containsKey('friendlyName'), isFalse);
+      expect(devices.single.containsKey('host'), isFalse);
+      expect(
+        devices.single['actions'],
+        containsPair('SetAVTransportURI', true),
+      );
+      expect(
+        devices.single['sinkMimeTypes'],
+        containsPair('audio/mpeg', true),
+      );
+      expect(devices.single['queue'], 'sonos');
+      expect(devices.single['quirks'], isA<Map<String, Object?>>());
+    });
+
+    testWidgets('- asks plainly, without listing the devices', (tester) async {
+      await pumpSharablePicker(tester);
+
+      await tester.tap(find.byIcon(Icons.upload));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Share what JellyBox found?'), findsOneWidget);
+      expect(find.textContaining('stays private'), findsOneWidget);
+      expect(
+        find.textContaining('support for different manufacturers'),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.textContaining('Sonos'),
+        ),
+        findsNothing,
+      );
+      expect(
+        find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.textContaining('transport actions'),
+        ),
+        findsNothing,
+      );
+    });
+  });
+
+  testWidgets('- greys out a queueless renderer on a phone', (tester) async {
+    await pumpPicker(
+      tester,
+      host: ControlPointHost.suspending,
+      renderers: [
+        rendererNamed('Kitchen', model: 'Sonos One'),
+        rendererNamed('Lounge TV', model: 'QE85', hasQueue: false),
+      ],
+    );
+
+    final playable = tester.widget<ListTile>(
+      find.ancestor(of: find.text('Kitchen'), matching: find.byType(ListTile)),
+    );
+    final greyed = tester.widget<ListTile>(
+      find.ancestor(
+        of: find.text('Lounge TV'),
+        matching: find.byType(ListTile),
+      ),
+    );
+
+    expect(playable.enabled, isTrue);
+    expect(greyed.enabled, isFalse);
+    expect(greyed.onTap, isNull);
+    expect(
+      find.text('Needs a speaker that holds its own queue'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('- hides a queueless renderer when the speaker also does Cast', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      host: ControlPointHost.suspending,
+      renderers: [
+        rendererNamed(
+          'Kitchen',
+          model: 'LSX II LT',
+          host: '10.0.0.20',
+          hasQueue: false,
+        ),
+        rendererNamed('Lounge TV', model: 'QE85', hasQueue: false),
+      ],
+      castDevices: [
+        castNamed('Kitchen', model: 'KEF LSX II LT', ip: '10.0.0.20'),
+      ],
+    );
+
+    expect(find.text('Kitchen'), findsOneWidget);
+    expect(find.byIcon(Icons.cast), findsOneWidget);
+    expect(find.text('10.0.0.20 · LSX II LT'), findsNothing);
+    expect(find.text('Lounge TV'), findsOneWidget);
+    expect(
+      find.text('Needs a speaker that holds its own queue'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('- shows both sides of a speaker when DLNA is playable', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      renderers: [
+        rendererNamed('Kitchen', model: 'LSX II LT', host: '10.0.0.20'),
+      ],
+      castDevices: [castNamed('Kitchen', ip: '10.0.0.20')],
+    );
+
+    expect(find.text('Kitchen'), findsNWidgets(2));
+    expect(find.byIcon(Icons.cast), findsOneWidget);
+    expect(find.byIcon(Icons.settings_input_antenna), findsOneWidget);
+  });
+
+  testWidgets('- matches the Cast twin by name when it has no address', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      host: ControlPointHost.suspending,
+      renderers: [
+        rendererNamed('Living Room', model: 'LSX II LT', hasQueue: false),
+      ],
+      castDevices: [castNamed('Living room', model: 'KEF LSX II LT')],
+    );
+
+    expect(find.byIcon(Icons.settings_input_antenna), findsNothing);
+    expect(find.text('Living room'), findsOneWidget);
+  });
+
+  testWidgets('- keeps a queueless namesake at another address', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      host: ControlPointHost.suspending,
+      renderers: [
+        rendererNamed(
+          'Kitchen',
+          model: 'Sonos One',
+          host: '10.0.0.9',
+          hasQueue: false,
+        ),
+      ],
+      castDevices: [castNamed('Kitchen', model: 'Nest Audio', ip: '10.0.0.30')],
+    );
+
+    expect(find.text('Kitchen'), findsNWidgets(2));
+    expect(find.byIcon(Icons.settings_input_antenna), findsOneWidget);
+  });
+
+  testWidgets('- keeps the renderer it is playing on even with a twin', (
+    tester,
+  ) async {
+    final kef = rendererNamed(
+      'Kitchen',
+      model: 'LSX II LT',
+      host: '10.0.0.20',
+      hasQueue: false,
+    );
+    await pumpPicker(
+      tester,
+      host: ControlPointHost.suspending,
+      renderers: [kef],
+      castDevices: [castNamed('Kitchen', ip: '10.0.0.20')],
+      activeTarget: _FakeTarget(kef.id, kef.name, PlaybackTargetKind.upnp),
+    );
+
+    expect(find.text('Kitchen'), findsNWidgets(2));
+    expect(find.byIcon(Icons.settings_input_antenna), findsOneWidget);
+    expect(find.byIcon(Icons.check), findsOneWidget);
+  });
+
+  testWidgets('- keeps a queueless renderer usable on a desktop', (
+    tester,
+  ) async {
+    await pumpPicker(
+      tester,
+      renderers: [rendererNamed('Lounge TV', model: 'QE85', hasQueue: false)],
+    );
+
+    final tile = tester.widget<ListTile>(
+      find.ancestor(
+        of: find.text('Lounge TV'),
+        matching: find.byType(ListTile),
+      ),
+    );
+
+    expect(tile.enabled, isTrue);
+    expect(tile.onTap, isNotNull);
+    expect(find.text('DLNA · QE85'), findsOneWidget);
+    expect(
+      find.text('Needs a speaker that holds its own queue'),
+      findsNothing,
+    );
+  });
+
+  testWidgets('- says so when nothing was found', (tester) async {
+    await pumpPicker(tester, renderers: const []);
+
+    expect(find.text('No DLNA devices found on this network.'), findsOneWidget);
+  });
+
+  group('PlaybackTargetButton', () {
+    Future<void> pumpBody(
+      WidgetTester tester,
+      Widget body, {
+      List<UpnpRenderer> renderers = const [],
+      ThemeData? theme,
+    }) => tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          upnpRenderersProvider.overrideWith(
+            (ref) => _FakeRenderersNotifier(renderers),
+          ),
+        ],
+        child: MaterialApp(
+          theme: theme,
+          home: Scaffold(body: body),
+        ),
+      ),
+    );
+
+    Future<void> pumpButton(
+      WidgetTester tester, {
+      double? size,
+      double iconThemeSize = 26,
+    }) => pumpBody(
+      tester,
+      IconTheme.merge(
+        data: IconThemeData(size: iconThemeSize),
+        child: PlaybackTargetButton(size: size),
+      ),
+    );
+
+    testWidgets('- matches the surrounding icon size in a player row', (
+      tester,
+    ) async {
+      await pumpButton(tester);
+
+      final button = tester.widget<IconButton>(find.byType(IconButton));
+      expect(button.iconSize, 26);
+    });
+
+    testWidgets('- carries a beta badge that does not eat the tap', (
+      tester,
+    ) async {
+      await pumpButton(tester);
+
+      expect(find.text('BETA'), findsOneWidget);
+
+      await tester.tapAt(tester.getCenter(find.text('BETA')));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Play on'), findsOneWidget);
+    });
+
+    testWidgets('- centres the badge text in its pill', (tester) async {
+      await pumpButton(tester, iconThemeSize: 24);
+
+      final label = tester.widget<Text>(find.text('BETA'));
+      expect(label.style!.fontSize, 9);
+      expect(label.textAlign, TextAlign.center);
+      expect(label.strutStyle!.forceStrutHeight, isTrue);
+      expect(label.strutStyle!.fontSize, 9);
+
+      final pill = find
+          .ancestor(of: find.text('BETA'), matching: find.byType(Container))
+          .first;
+      final pillRect = tester.getRect(pill);
+      final textRect = tester.getRect(find.text('BETA'));
+
+      expect(
+        textRect.center.dx,
+        moreOrLessEquals(pillRect.center.dx, epsilon: 0.75),
+      );
+      expect(
+        textRect.center.dy - pillRect.center.dy,
+        moreOrLessEquals(0.9, epsilon: 0.3),
+      );
+      expect(textRect.height, lessThanOrEqualTo(pillRect.height));
+      expect(textRect.width, lessThanOrEqualTo(pillRect.width));
+    });
+
+    testWidgets('- opens the menu above the button on a desktop', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+
+      await pumpBody(
+        tester,
+        Align(
+          alignment: Alignment.bottomRight,
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: PlaybackTargetButton(size: 44),
+          ),
+        ),
+      );
+
+      expect(find.text('Play on'), findsNothing);
+
+      final buttonRect = tester.getRect(find.byType(IconButton));
+      await tester.tap(find.byType(IconButton));
+      await tester.pumpAndSettle();
+
+      final menuRect = tester.getRect(find.byType(PlaybackTargetMenu));
+      expect(find.text('Play on'), findsOneWidget);
+      expect(menuRect.bottom, lessThanOrEqualTo(buttonRect.top));
+      expect(menuRect.right, moreOrLessEquals(buttonRect.right, epsilon: 1));
+      expect(menuRect.left, greaterThanOrEqualTo(0));
+    });
+
+    testWidgets('- closes once the picked target is connected', (
+      tester,
+    ) async {
+      final outputs = _FakeOutputs();
+      final container = ProviderContainer(
+        overrides: [
+          outputControllerProvider.overrideWithValue(outputs),
+          upnpRenderersProvider.overrideWith(
+            (ref) => _FakeRenderersNotifier([
+              rendererNamed('Kitchen', model: 'Sonos One'),
+            ]),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: MaterialApp(
+            home: Scaffold(body: Center(child: PlaybackTargetButton())),
+          ),
+        ),
+      );
+
+      await tester.tap(find.byType(IconButton));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Kitchen'));
+      await tester.pump();
+
+      expect(find.text('Play on'), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+
+      container.read(playbackTargetProvider.notifier).select(outputs.target!);
+      outputs.connected.complete();
+      await tester.pumpAndSettle();
+
+      expect(find.text('Play on'), findsNothing);
+    });
+
+    testWidgets('- closes on a tap outside', (tester) async {
+      await pumpBody(
+        tester,
+        Align(
+          alignment: Alignment.bottomCenter,
+          child: PlaybackTargetButton(),
+        ),
+      );
+
+      await tester.tap(find.byType(IconButton));
+      await tester.pumpAndSettle();
+      expect(find.text('Play on'), findsOneWidget);
+
+      await tester.tapAt(const Offset(20, 20));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Play on'), findsNothing);
+    });
+
+    testWidgets('- opens a full-width sheet on a phone', (tester) async {
+      tester.view.physicalSize = const Size(375, 812);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+
+      await pumpBody(
+        tester,
+        Column(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [PlaybackTargetButton()],
+        ),
+      );
+
+      await tester.tap(find.byType(IconButton));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(BottomSheet), findsOneWidget);
+      expect(tester.getSize(find.byType(PlaybackTargetMenu)).width, 375);
+    });
+
+    testWidgets('- tints the icon and badge with the colours it is given', (
+      tester,
+    ) async {
+      await pumpBody(
+        tester,
+        const PlaybackTargetButton(
+          color: Colors.white,
+          activeColor: Colors.amber,
+        ),
+        theme: ThemeData(
+          colorScheme: const ColorScheme.dark(
+            primary: Colors.blue,
+            onPrimary: Colors.blue,
+          ),
+        ),
+      );
+
+      expect(
+        IconTheme.of(tester.element(find.byIcon(Icons.cast))).color,
+        Colors.white,
+      );
+
+      final label = tester.widget<Text>(find.text('BETA'));
+      expect(label.style!.color, Colors.white);
+
+      final pill = tester.widget<Container>(
+        find
+            .ancestor(of: find.text('BETA'), matching: find.byType(Container))
+            .first,
+      );
+      expect(
+        (pill.decoration! as BoxDecoration).color,
+        Colors.amber,
+      );
+    });
+
+    testWidgets('- treats an explicit size as the button box, not the glyph', (
+      tester,
+    ) async {
+      await pumpButton(tester, size: 44);
+
+      final button = tester.widget<IconButton>(find.byType(IconButton));
+      expect(button.iconSize, lessThan(28));
+
+      final box = tester.getSize(find.byType(IconButton));
+      expect(box.width, lessThanOrEqualTo(48));
+      expect(box.height, lessThanOrEqualTo(48));
+    });
+  });
+}
+
+class _FakeCloudNotifier extends StateNotifier<CloudState>
+    with Mock
+    implements CloudNotifier {
+  _FakeCloudNotifier(super.state);
+}

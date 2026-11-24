@@ -1,0 +1,144 @@
+import 'package:freezed_annotation/freezed_annotation.dart';
+import 'package:jplayer/src/domain/models/library_item/artist_ref.dart';
+import 'package:jplayer/src/domain/models/library_item/audio_source_info.dart';
+import 'package:jplayer/src/domain/models/library_item/image_refs.dart';
+import 'package:jplayer/src/domain/models/library_item/item_kind.dart';
+import 'package:jplayer/src/domain/models/library_item/playback_user_data.dart';
+
+part 'library_item.freezed.dart';
+
+@freezed
+abstract class LibraryItem with _$LibraryItem {
+  const factory LibraryItem({
+    required String id,
+    required String name,
+    required ItemKind kind,
+    @Default(0) int indexNumber,
+    int? discNumber,
+    String? discTitle,
+    String? discCoverArt,
+    @Default(Duration.zero) Duration duration,
+    String? path,
+    String? collectionType,
+    String? playlistItemId,
+    String? overview,
+    int? productionYear,
+    DateTime? originalReleaseDate,
+    @Default([]) List<String> releaseTypes,
+    String? albumId,
+    String? albumName,
+    String? albumArtist,
+    @Default([]) List<ArtistRef> albumArtists,
+    @Default([]) List<ArtistRef> artists,
+    @Default([]) List<String> genres,
+    @Default(ImageRefs()) ImageRefs images,
+    @Default(false) bool hasLyrics,
+    @Default(PlaybackUserData()) PlaybackUserData userData,
+    @Default([]) List<AudioSourceInfo> audioSources,
+    @Default({}) Map<String, String> externalIds,
+  }) = _LibraryItem;
+
+  const LibraryItem._();
+
+  String get primaryImageId => images.primaryItemId ?? id;
+
+  String? get radioStreamUrl {
+    for (final source in audioSources) {
+      if (source.url != null) return source.url;
+    }
+    final path = this.path;
+    if (path != null &&
+        (path.startsWith('http://') || path.startsWith('https://'))) {
+      return path;
+    }
+    return null;
+  }
+
+  bool get isRadioStream => kind == ItemKind.song && radioStreamUrl != null;
+
+  List<ArtistRef> get effectiveArtists =>
+      artists.isNotEmpty ? artists : albumArtists;
+
+  String get artistLabel => effectiveArtists.isNotEmpty
+      ? effectiveArtists.map((artist) => artist.name).join(', ')
+      : (albumArtist ?? '');
+
+  static int compareAlbumOrder(LibraryItem a, LibraryItem b) {
+    final byDisc = (a.discNumber ?? 0).compareTo(b.discNumber ?? 0);
+    return byDisc != 0 ? byDisc : a.indexNumber.compareTo(b.indexNumber);
+  }
+
+  // ignore: prefer_constructors_over_static_methods
+  static LibraryItem fromJson(Map<String, dynamic> json) => LibraryItem(
+    id: json['id'] as String,
+    name: json['name'] as String,
+    kind: ItemKind.values.byName(json['kind'] as String),
+    indexNumber: json['indexNumber'] as int? ?? 0,
+    discNumber: json['discNumber'] as int?,
+    discTitle: json['discTitle'] as String?,
+    discCoverArt: json['discCoverArt'] as String?,
+    duration: Duration(milliseconds: json['durationMs'] as int? ?? 0),
+    path: json['path'] as String?,
+    collectionType: json['collectionType'] as String?,
+    playlistItemId: json['playlistItemId'] as String?,
+    overview: json['overview'] as String?,
+    productionYear: json['productionYear'] as int?,
+    originalReleaseDate: json['originalReleaseDate'] != null
+        ? DateTime.tryParse(json['originalReleaseDate'] as String)
+        : null,
+    releaseTypes: (json['releaseTypes'] as List<dynamic>? ?? []).cast<String>(),
+    albumId: json['albumId'] as String?,
+    albumName: json['albumName'] as String?,
+    albumArtist: json['albumArtist'] as String?,
+    albumArtists: (json['albumArtists'] as List<dynamic>? ?? [])
+        .map((e) => ArtistRef.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    artists: (json['artists'] as List<dynamic>? ?? [])
+        .map((e) => ArtistRef.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    genres: (json['genres'] as List<dynamic>? ?? []).cast<String>(),
+    images: json['images'] != null
+        ? ImageRefs.fromJson(json['images'] as Map<String, dynamic>)
+        : const ImageRefs(),
+    hasLyrics: json['hasLyrics'] as bool? ?? false,
+    userData: json['userData'] != null
+        ? PlaybackUserData.fromJson(json['userData'] as Map<String, dynamic>)
+        : const PlaybackUserData(),
+    audioSources: (json['audioSources'] as List<dynamic>? ?? [])
+        .map((e) => AudioSourceInfo.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    externalIds: (json['externalIds'] as Map<String, dynamic>? ?? {})
+        .cast<String, String>(),
+  );
+}
+
+extension LibraryItemJson on LibraryItem {
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'kind': kind.name,
+    'indexNumber': indexNumber,
+    'discNumber': discNumber,
+    'discTitle': discTitle,
+    'discCoverArt': discCoverArt,
+    'durationMs': duration.inMilliseconds,
+    'path': path,
+    'collectionType': collectionType,
+    'playlistItemId': playlistItemId,
+    'overview': overview,
+    'productionYear': productionYear,
+    'originalReleaseDate': originalReleaseDate?.toIso8601String(),
+    'releaseTypes': releaseTypes,
+    'albumId': albumId,
+    'albumName': albumName,
+    'albumArtist': albumArtist,
+    'albumArtists': albumArtists.map((artist) => artist.toJson()).toList(),
+    'artists': artists.map((artist) => artist.toJson()).toList(),
+    'genres': genres,
+    'images': images.toJson(),
+    'hasLyrics': hasLyrics,
+    'userData': userData.toJson(),
+    'audioSources': audioSources.map((source) => source.toJson()).toList(),
+    'externalIds': externalIds,
+  };
+}

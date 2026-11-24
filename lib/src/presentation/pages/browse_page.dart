@@ -1,0 +1,1045 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+import 'package:jplayer/resources/j_player_icons.dart';
+import 'package:jplayer/src/config/routes.dart';
+import 'package:jplayer/src/core/enums/enums.dart';
+import 'package:jplayer/src/data/providers/providers.dart';
+import 'package:jplayer/src/domain/models/models.dart';
+import 'package:jplayer/src/domain/providers/providers.dart';
+import 'package:jplayer/src/presentation/utils/utils.dart';
+import 'package:jplayer/src/presentation/widgets/widgets.dart';
+import 'package:jplayer/src/providers/color_scheme_provider.dart';
+import 'package:jplayer/src/providers/connectivity_provider.dart';
+import 'package:jplayer/src/providers/current_server_id_provider.dart';
+
+class BrowsePage extends ConsumerStatefulWidget {
+  const BrowsePage({super.key});
+
+  @override
+  ConsumerState<BrowsePage> createState() => _BrowsePageState();
+}
+
+class _BrowsePageState extends ConsumerState<BrowsePage>
+    with TickerProviderStateMixin {
+  static const _searchButtonWidth = 48.0;
+  static const _searchDismissScrollDistance = 64.0;
+  static const _searchFieldHeight = 42.0;
+  static const _iconRowHeight = 48.0;
+  static const _chipsRowHeight = 48.0;
+  static const _barRowsSpacing = 4.0;
+  static const _iconSlotWidth = 44.0;
+  late final ValueNotifier<ItemList> _currentView;
+  late final Map<EntityFilter, bool> _availableFilters;
+  late final ValueNotifier<Filter> _appliedFilter;
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
+  final _artistScope = AnchoredDropdownController();
+  final _searchOpened = ValueNotifier<bool>(false);
+  final _searchQuery = ValueNotifier<String>('');
+  final _searchController = TextEditingController();
+  final _searchFocusNode = FocusNode();
+  final _scrollController = ScrollController();
+  final GlobalKey _listKey = GlobalKey();
+  Timer? _searchDebounce;
+  Timer? _letterDebounce;
+  int _jumpSequence = 0;
+  double _scrolledSinceSearchOpened = 0;
+
+  late final AnimationController _searchAnimation = AnimationController(
+    duration: const Duration(milliseconds: 260),
+    vsync: this,
+  );
+  late final AnimationController _iconsReveal = AnimationController(
+    duration: const Duration(milliseconds: 460),
+    vsync: this,
+  );
+  bool _wasVisible = false;
+
+  late final Animation<double> _searchExpansion = CurvedAnimation(
+    parent: _searchAnimation,
+    curve: Curves.easeOutCubic,
+    reverseCurve: Curves.easeInCubic,
+  );
+
+  late ThemeData _theme;
+  late DeviceType _device;
+
+  Map<ItemList, String> get _viewLabels => {
+    ItemList.albums: 'Albums',
+    ItemList.artists: 'Artists',
+    ItemList.genres: 'Genres',
+    ItemList.playlists: 'Playlists',
+    ItemList.songs: 'Songs',
+  };
+
+  void _onAlbumTap(LibraryItem album) {
+    context.pushNamed(
+      Routes.album.name,
+      extra: {'album': album},
+    );
+  }
+
+  void _onArtistTap(LibraryItem artist) => context.pushNamed(
+    Routes.artist.name,
+    extra: {'artist': artist},
+  );
+
+  void _onGenreTap(LibraryItem genre) => context.pushNamed(
+    Routes.genre.name,
+    extra: {'genre': genre},
+  );
+
+  void _onPlaylistTap(LibraryItem playlist) {
+    ref.read(currentPlaylistProvider.notifier).setPlaylist(playlist);
+    context.pushNamed(
+      Routes.playlist.name,
+      extra: {'playlist': playlist},
+    );
+  }
+
+  Future<void> _onPlaySetPressed(LibraryItem item, ItemList view) async {
+    final notifier = ref.read(setPlaybackProvider.notifier);
+    try {
+      final result = await switch (view) {
+        ItemList.albums => notifier.playAlbum(item),
+        ItemList.artists => notifier.playArtist(item),
+        ItemList.genres => notifier.playGenre(item),
+        ItemList.playlists => notifier.playPlaylist(item),
+        ItemList.songs => Future.value(SetPlaybackResult.busy),
+      };
+      if (result == SetPlaybackResult.empty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Nothing to play in "${item.name}"')),
+        );
+      }
+    } on Object catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not start playing "${item.name}"')),
+        );
+      }
+    }
+  }
+
+  void _onSongTap(LibraryItem song, List<LibraryItem> allSongs) {
+    final syntheticAlbum = LibraryItem(
+      id: song.albumId ?? song.id,
+      name: song.albumName ?? '',
+      kind: ItemKind.album,
+      albumArtist: song.albumArtist,
+      albumArtists: song.albumArtists,
+      images: song.images,
+    );
+    ref.read(playbackProvider.notifier).play(song, allSongs, syntheticAlbum);
+  }
+
+  Future<void> _onLikePressed(LibraryItem song) =>
+      _onItemLikePressed(song, ItemList.songs);
+
+  Future<void> _onSongRated(LibraryItem song, int rating) async {
+    final updated = await rateItem(ref, song, rating);
+    ref.read(itemListProvider(ItemList.songs).notifier).updateItem(updated);
+  }
+
+  Future<void> _onItemLikePressed(LibraryItem item, ItemList view) async {
+    final isFavorite = item.userData.isFavorite;
+    await ref
+        .read(mediaServerClientProvider)
+        .setFavorite(item.id, favorite: !isFavorite);
+    ref.read(favouritesChangedProvider.notifier).state++;
+    ref
+        .read(itemListProvider(view).notifier)
+        .updateItem(
+          item.copyWith(
+            userData: item.userData.copyWith(isFavorite: !isFavorite),
+          ),
+        );
+  }
+
+  void _onCreateNewPlaylist() => unawaited(
+    showFormModal<void>(
+      context,
+      builder: (context) => CreatePlaylistForm(
+        onCreated: () => ref.invalidate(playlistsProvider),
+      ),
+    ),
+  );
+
+  Future<void> _onDeletePlaylist(LibraryItem playlist) async {
+    final shouldDelete = await showAppDialog<bool>(
+      context,
+      builder: (context) => AlertDialog.adaptive(
+        title: Text.rich(
+          TextSpan(
+            text: 'Delete ',
+            children: [
+              TextSpan(
+                text: '"${playlist.name}"',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const TextSpan(text: '?'),
+            ],
+          ),
+          textAlign: TextAlign.center,
+        ),
+        actions: [
+          AdaptiveDialogAction(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('No'),
+          ),
+          AdaptiveDialogAction(
+            onPressed: () => Navigator.of(context).pop(true),
+            isDestructiveAction: true,
+            child: const Text('Yes'),
+          ),
+        ],
+      ),
+    );
+    if ((shouldDelete ?? false) && mounted) {
+      await ref.read(mediaServerClientProvider).deletePlaylist(playlist.id);
+      ref.invalidate(playlistsProvider);
+    }
+  }
+
+  double get _navigationBarHeight => _device.isMobile
+      ? _iconRowHeight + _barRowsSpacing + _chipsRowHeight
+      : 100;
+
+  double get _searchTrailingWidth =>
+      _device.isMobile ? _searchButtonWidth + 40 : 40 + 12 + 40;
+
+  double get _rowExtent => (_device.isMobile ? 46.0 : 56.0) + 16;
+
+  void _onLetterSelected(String letter) {
+    _letterDebounce?.cancel();
+    _letterDebounce = Timer(
+      const Duration(milliseconds: 80),
+      () => unawaited(_jumpToLetter(letter)),
+    );
+  }
+
+  Future<void> _jumpToLetter(String letter) async {
+    final view = _currentView.value;
+    final sequence = ++_jumpSequence;
+    final index = await ref
+        .read(itemListProvider(view).notifier)
+        .indexOfLetter(letter);
+    if (index == null ||
+        !mounted ||
+        sequence != _jumpSequence ||
+        _currentView.value != view) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && sequence == _jumpSequence) _scrollToIndex(index);
+    });
+  }
+
+  void _scrollToIndex(int index) {
+    final sliver = _listKey.currentContext?.findRenderObject();
+    if (sliver is! RenderSliver || !_scrollController.hasClients) return;
+    final constraints = sliver.constraints;
+    final double offset;
+    if (sliver is RenderSliverFixedExtentBoxAdaptor) {
+      final extent = sliver.itemExtent;
+      if (extent == null) return;
+      offset = index * extent;
+    } else if (sliver is RenderSliverGrid) {
+      offset = sliver.gridDelegate
+          .getLayout(constraints)
+          .getGeometryForChildIndex(index)
+          .scrollOffset;
+    } else {
+      return;
+    }
+    final target =
+        constraints.precedingScrollExtent + offset - _navigationBarHeight;
+    _scrollController.jumpTo(
+      target.clamp(0.0, _scrollController.position.maxScrollExtent),
+    );
+  }
+
+  LibraryItem? _itemAt(ItemList view, PagedItems list, int index) {
+    ref.read(itemListProvider(view).notifier).touchPage(index ~/ list.pageSize);
+    return list.itemAt(index);
+  }
+
+  void _openSearch() {
+    _searchOpened.value = true;
+    _scrolledSinceSearchOpened = 0;
+    _searchAnimation.forward().then((_) {
+      if (mounted && _searchOpened.value) _searchFocusNode.requestFocus();
+    });
+  }
+
+  void _closeSearch() {
+    if (!_searchOpened.value) return;
+    _searchDebounce?.cancel();
+    _searchOpened.value = false;
+    _searchQuery.value = '';
+    _searchController.clear();
+    _searchFocusNode.unfocus();
+    ref.read(searchProvider.notifier).state = null;
+    _searchAnimation.reverse();
+  }
+
+  void _onSearchChanged(String query) {
+    _searchQuery.value = query.trim();
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 500), () {
+      ref.read(searchProvider.notifier).state = query.trim();
+    });
+  }
+
+  bool _onScrollNotification(ScrollNotification notification) {
+    if (notification is! ScrollUpdateNotification ||
+        notification.metrics.axis != Axis.vertical ||
+        !_searchOpened.value ||
+        _searchController.text.isNotEmpty) {
+      return false;
+    }
+
+    final delta = notification.scrollDelta ?? 0;
+    if (delta == 0) return false;
+
+    if (delta.isNegative != _scrolledSinceSearchOpened.isNegative) {
+      _scrolledSinceSearchOpened = 0;
+    }
+    _scrolledSinceSearchOpened += delta;
+
+    if (_scrolledSinceSearchOpened.abs() >= _searchDismissScrollDistance) {
+      _closeSearch();
+    }
+    return false;
+  }
+
+  void _onSearchFocusChanged() {
+    if (!_searchFocusNode.hasFocus && _searchController.text.isEmpty) {
+      _closeSearch();
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _searchFocusNode.addListener(_onSearchFocusChanged);
+    final ItemList initialView =
+        ref.read(browseViewRequestProvider) ??
+        ref.read(defaultBrowseTabProvider);
+    _currentView = ValueNotifier(initialView)
+      ..addListener(() => _restoreSort(_currentView.value));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ref.read(browseViewRequestProvider.notifier).state = null;
+      if (ref.read(filterProvider) == _savedSort(initialView)) return;
+      _restoreSort(initialView);
+    });
+    _availableFilters = {
+      for (final value in EntityFilter.values) value: false,
+    };
+    _appliedFilter = ValueNotifier(Filter(orderBy: EntityFilter.values.first))
+      ..addListener(
+        () => ref
+            .read(filterProvider.notifier)
+            .filter(
+              field: _appliedFilter.value.orderBy,
+              desc: _appliedFilter.value.desc,
+            ),
+      );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _theme = Theme.of(context);
+    _device = DeviceType.fromScreenSize(MediaQuery.sizeOf(context));
+
+    final isVisible = TickerMode.of(context);
+    if (isVisible && !_wasVisible) _iconsReveal.forward(from: 0);
+    _wasVisible = isVisible;
+  }
+
+  Widget _revealFromBell({required int slotsFromBell, required Widget child}) {
+    final interval = Interval(
+      0.12 * (slotsFromBell - 1),
+      0.7 + 0.1 * (slotsFromBell - 1),
+      curve: Curves.easeOutCubic,
+    );
+    return AnimatedBuilder(
+      animation: _iconsReveal,
+      builder: (context, child) {
+        final t = interval.transform(_iconsReveal.value);
+        return Opacity(
+          opacity: t,
+          child: Transform.translate(
+            offset: Offset(slotsFromBell * _iconSlotWidth * (1 - t), 0),
+            child: child,
+          ),
+        );
+      },
+      child: child,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.listen(
+      defaultBrowseTabProvider,
+      (previous, next) => _currentView.value = next,
+    );
+    ref.listen(browseViewRequestProvider, (previous, next) {
+      if (next == null) return;
+      _currentView.value = next;
+      ref.read(browseViewRequestProvider.notifier).state = null;
+    });
+    ref.listen(browseTabSelectedProvider, (previous, next) => _closeSearch());
+    return Scaffold(
+      key: _scaffoldKey,
+      body: ValueListenableBuilder(
+        valueListenable: _currentView,
+        builder: (context, view, child) => ValueListenableBuilder(
+          valueListenable: _searchQuery,
+          builder: (context, query, child) => Consumer(
+            builder: (context, ref, child) {
+              final rulerVisible =
+                  query.isEmpty &&
+                  (ref.watch(letterIndexAvailableProvider(view)).valueOrNull ??
+                      false);
+              final reversed = ref.watch(
+                filterProvider.select((filter) => filter.desc),
+              );
+              return Stack(
+                children: [
+                  _pageScaffold(rulerVisible: rulerVisible),
+                  if (rulerVisible)
+                    Positioned(
+                      right: _device.isMobile ? 0 : 4,
+                      top:
+                          MediaQuery.paddingOf(context).top +
+                          _navigationBarHeight +
+                          8,
+                      bottom: 8,
+                      child: LetterRuler(
+                        reversed: reversed,
+                        haptics: _device.isMobile,
+                        colorScheme: ref
+                            .watch(artworkSchemeProvider)
+                            .valueOrNull,
+                        onLetterSelected: _onLetterSelected,
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _pageScaffold({
+    required bool rulerVisible,
+  }) => NotificationListener<ScrollNotification>(
+    onNotification: _onScrollNotification,
+    child: ScrollablePageScaffold(
+      controller: _scrollController,
+      useGradientBackground: true,
+      showScrollbar: !rulerVisible,
+      navigationBar: PreferredSize(
+        preferredSize: Size.fromHeight(_navigationBarHeight),
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: _device.isMobile ? 16 : 30,
+          ),
+          child: _navigationBarContent(),
+        ),
+      ),
+      loadMoreData: () => _searchQuery.value.isNotEmpty
+          ? Future<void>.value()
+          : ref.read(itemListProvider(_currentView.value).notifier).loadMore(),
+      contentPadding: EdgeInsets.only(
+        left: _device.isMobile ? 16 : 30,
+        right: _device.isMobile
+            ? (rulerVisible ? 16 + LetterRuler.defaultWidth : 16)
+            : (rulerVisible ? 38 : 30),
+        bottom: 30,
+      ),
+      slivers: [
+        ValueListenableBuilder(
+          valueListenable: _searchQuery,
+          builder: (context, query, child) {
+            if (query.isEmpty) return _libraryList();
+
+            return Consumer(
+              builder: (context, ref, child) => SearchResultsSliver(
+                isPending: query != (ref.watch(searchProvider)?.trim() ?? ''),
+              ),
+            );
+          },
+        ),
+      ],
+    ),
+  );
+
+  Widget _libraryList() => ValueListenableBuilder(
+    valueListenable: _currentView,
+    builder: (context, value, child) => Consumer(
+      builder: (context, ref, child) {
+        final provider = ref.watch(itemListProvider(value));
+        return provider.when(
+          data: (list) {
+            if (value == ItemList.songs) {
+              final currentSongId = ref.watch(
+                barSongProvider.select((song) => song?.id),
+              );
+              return SliverFixedExtentList.builder(
+                key: _listKey,
+                itemExtent: _rowExtent,
+                itemBuilder: (context, index) {
+                  final song = _itemAt(value, list, index);
+                  if (song == null) return SongRowShimmer(device: _device);
+                  return SongRowView(
+                    song: song,
+                    isPlaying: currentSongId == song.id,
+                    onTap: (song) => _onSongTap(song, list.items),
+                    onLikePressed: _onLikePressed,
+                    onRatingChanged: _onSongRated,
+                    optionsBuilder: (context) => contextMenuActions(
+                      context,
+                      ref,
+                      song,
+                      scope: ContextMenuScope.browse,
+                      onLike: _onLikePressed,
+                    ),
+                  );
+                },
+                itemCount: list.length,
+              );
+            }
+            void onItemTap(LibraryItem item) => switch (value) {
+              ItemList.albums => _onAlbumTap(item),
+              ItemList.artists => _onArtistTap(item),
+              ItemList.genres => _onGenreTap(item),
+              ItemList.playlists => _onPlaylistTap(item),
+              ItemList.songs => null,
+            };
+            List<ContextMenuAction> optionsFor(
+              BuildContext context,
+              LibraryItem item,
+            ) => [
+              if (value == ItemList.playlists)
+                ContextMenuAction(
+                  entry: ContextMenuEntry.deletePlaylist,
+                  icon: const Icon(Icons.delete_outline),
+                  label: const Text('Delete playlist'),
+                  run: () => _onDeletePlaylist(item),
+                ),
+              ...contextMenuActions(
+                context,
+                ref,
+                item,
+                scope: ContextMenuScope.browse,
+                onLike: (item) => _onItemLikePressed(item, value),
+              ),
+            ];
+
+            if (ref.watch(browseLayoutProvider) == BrowseLayout.rows) {
+              return SliverFixedExtentList.builder(
+                key: _listKey,
+                itemExtent: _rowExtent,
+                itemBuilder: (context, index) {
+                  final item = _itemAt(value, list, index);
+                  if (item == null) return SongRowShimmer(device: _device);
+                  return ItemRowView(
+                    item: item,
+                    onTap: onItemTap,
+                    onPlayPressed: (item) => _onPlaySetPressed(item, value),
+                    optionsBuilder: (context) => optionsFor(context, item),
+                  );
+                },
+                itemCount: list.length,
+              );
+            }
+
+            return SliverGrid.builder(
+              key: _listKey,
+              gridDelegate: AlbumCardMetrics.gridDelegate(_device),
+              itemBuilder: (context, index) {
+                final item = _itemAt(value, list, index);
+                if (item == null) {
+                  return AlbumCardShimmer(
+                    width: AlbumCardMetrics.width(_device),
+                    device: _device,
+                  );
+                }
+                return AlbumView(
+                  album: item,
+                  onTap: (item) => switch (value) {
+                    ItemList.albums => _onAlbumTap(item),
+                    ItemList.artists => _onArtistTap(item),
+                    ItemList.genres => _onGenreTap(item),
+                    ItemList.playlists => _onPlaylistTap(item),
+                    ItemList.songs => null,
+                  },
+                  onPlayPressed: (value == ItemList.songs)
+                      ? null
+                      : (item) => _onPlaySetPressed(item, value),
+                  optionsBuilder: (context) => optionsFor(context, item),
+                );
+              },
+              itemCount: list.length,
+            );
+          },
+          error: (error, stackTrace) => SliverToBoxAdapter(
+            child: ref.watch(isOfflineProvider)
+                ? OfflineNotice(
+                    message:
+                        "You're offline. Your library will be back "
+                        'once the server is reachable.',
+                    showDownloadsLink: true,
+                  )
+                : Text(error.toString()),
+          ),
+          loading: () =>
+              (value == ItemList.songs ||
+                  ref.watch(browseLayoutProvider) == BrowseLayout.rows)
+              ? SliverToBoxAdapter(
+                  child: SongRowsShimmer(device: _device, count: 8),
+                )
+              : AlbumCardsGridShimmer(device: _device),
+        );
+      },
+    ),
+  );
+
+  @override
+  void dispose() {
+    _currentView.dispose();
+    _appliedFilter.dispose();
+    _searchDebounce?.cancel();
+    _letterDebounce?.cancel();
+    _scrollController.dispose();
+    _searchAnimation.dispose();
+    _iconsReveal.dispose();
+    _searchOpened.dispose();
+    _searchQuery.dispose();
+    _searchController.dispose();
+    _searchFocusNode
+      ..removeListener(_onSearchFocusChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  Widget _pageViewToggle() => ChipTheme(
+    data: ChipTheme.of(context).copyWith(
+      labelStyle: TextStyle(
+        fontSize: _device.isMobile ? 14 : 16,
+        fontFamily: _theme.textTheme.bodyMedium?.fontFamily,
+      ),
+    ),
+    child: SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Row(
+        spacing: 12,
+        children: [
+          for (final value in ItemList.values)
+            ValueListenableBuilder(
+              valueListenable: _currentView,
+              builder: (context, currentView, child) =>
+                  value == ItemList.artists
+                  ? _artistsChip(isSelected: value == currentView)
+                  : _viewChip(
+                      label: _viewLabels[value] ?? '???',
+                      isSelected: value == currentView,
+                      onPressed: () => _currentView.value = value,
+                    ),
+            ),
+        ],
+      ),
+    ),
+  );
+
+  OutlinedBorder get _chipShape =>
+      RoundedRectangleBorder(borderRadius: BorderRadius.circular(8));
+
+  Color? _chipColor({required bool isSelected}) => isSelected
+      ? _theme.chipTheme.selectedColor
+      : _theme.chipTheme.backgroundColor;
+
+  Widget _viewChip({
+    required String label,
+    required bool isSelected,
+    required VoidCallback onPressed,
+  }) => ActionChip(
+    label: Text(label),
+    shape: _chipShape,
+    backgroundColor: _chipColor(isSelected: isSelected),
+    onPressed: onPressed,
+  );
+
+  Widget _artistsChip({required bool isSelected}) => Consumer(
+    builder: (context, ref, child) {
+      final supported = ref.watch(serverCapabilitiesProvider).artistScopes;
+      if (supported.length < 2) {
+        return _viewChip(
+          label: _viewLabels[ItemList.artists] ?? '???',
+          isSelected: isSelected,
+          onPressed: () => _currentView.value = ItemList.artists,
+        );
+      }
+      final scope = ref.watch(effectiveArtistScopeProvider);
+      return AnchoredDropdown(
+        controller: _artistScope,
+        alignment: DropAlignment.anchorCenter,
+        menuBuilder: (context) => _artistScopeMenu(supported, scope),
+        child: InputChip(
+          label: Text(_artistScopeLabel(scope)),
+          labelPadding: const EdgeInsets.only(left: 11, right: 3),
+          shape: _chipShape,
+          backgroundColor: _chipColor(isSelected: isSelected),
+          onPressed: () => _currentView.value = ItemList.artists,
+          deleteIcon: const Icon(Icons.expand_more, size: 16),
+          deleteButtonTooltipMessage: 'Choose which artists to browse',
+          onDeleted: _artistScope.toggle,
+        ),
+      );
+    },
+  );
+
+  Widget _artistScopeMenu(Set<ArtistScope> supported, ArtistScope selected) =>
+      Consumer(
+        builder: (context, ref, child) => Material(
+          key: const Key('artist-scope-menu'),
+          color: _theme.canvasColor,
+          elevation: 8,
+          borderRadius: BorderRadius.circular(6),
+          clipBehavior: Clip.antiAlias,
+          child: SizedBox(
+            width: 200,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const SizedBox(height: 8),
+                for (final scope in ArtistScope.values)
+                  if (supported.contains(scope))
+                    InkWell(
+                      onTap: () {
+                        ref
+                            .read(appSettingsProvider.notifier)
+                            .setValue(AppSetting.artistBrowseScope, scope.name);
+                        _currentView.value = ItemList.artists;
+                        _artistScope.close();
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 10,
+                        ),
+                        child: Text(
+                          _artistScopeLabel(scope),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 14,
+                            height: 1.2,
+                            color: scope == selected
+                                ? _theme.colorScheme.primary
+                                : _theme.colorScheme.onPrimary,
+                          ),
+                        ),
+                      ),
+                    ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        ),
+      );
+
+  String _artistScopeLabel(ArtistScope scope) => switch (scope) {
+    ArtistScope.albumArtists => 'Album Artists',
+    ArtistScope.allArtists => 'Artists',
+  };
+
+  Filter _savedSort(ItemList view) {
+    final saved = ref.read(browseSortProvider(view));
+    final offered = view.sortOptions(
+      albumRatingSort: ref.read(serverCapabilitiesProvider).albumRatingSort,
+    );
+    if (offered.contains(saved.orderBy)) return saved;
+    return Filter(
+      orderBy: view.defaultSortField,
+      desc: view.defaultSortDescending,
+    );
+  }
+
+  void _restoreSort(ItemList view) {
+    final sort = _savedSort(view);
+    ref
+        .read(filterProvider.notifier)
+        .filter(field: sort.orderBy, desc: sort.desc);
+  }
+
+  void _applyProviderFilter(EntityFilter? value) {
+    if (value == null) return;
+    final next = ref.read(filterProvider).select(value);
+    ref
+        .read(filterProvider.notifier)
+        .filter(field: next.orderBy, desc: next.desc);
+    final serverId = ref.read(currentServerIdProvider);
+    if (serverId == null) return;
+    ref
+        .read(appSettingsProvider.notifier)
+        .setBrowseSort(serverId, _currentView.value, next);
+  }
+
+  Widget _filterButton() => ValueListenableBuilder(
+    valueListenable: _currentView,
+    builder: (context, view, child) => Consumer(
+      builder: (context, ref, child) {
+        final filter = ref.watch(filterProvider);
+        final albumRatingSort = ref.watch(
+          serverCapabilitiesProvider.select((c) => c.albumRatingSort),
+        );
+        return AppDropdown<EntityFilter>(
+          icon: Icons.sort,
+          iconSize: _headerIconSize,
+          value: filter.orderBy,
+          onChanged: _applyProviderFilter,
+          entries: [
+            for (final value in view.sortOptions(
+              albumRatingSort: albumRatingSort,
+            ))
+              AppDropdownEntry(
+                value: value,
+                label: value.label,
+                trailingBuilder: (color) => Icon(
+                  filter.desc ? Icons.arrow_upward : Icons.arrow_downward,
+                  color: color,
+                ),
+              ),
+          ],
+        );
+      },
+    ),
+  );
+
+  Widget _layoutButton() => ValueListenableBuilder(
+    valueListenable: _currentView,
+    builder: (context, currentView, child) => AnimatedSwitcher(
+      duration: const Duration(milliseconds: 100),
+      transitionBuilder: (child, animation) => ScaleTransition(
+        scale: animation,
+        child: child,
+      ),
+      child: currentView == ItemList.songs
+          ? const SizedBox.shrink()
+          : _layoutDropdown(),
+    ),
+  );
+
+  Widget _layoutDropdown() => Consumer(
+    builder: (context, ref, child) {
+      final layout = ref.watch(browseLayoutProvider);
+      return AppDropdown<BrowseLayout>(
+        icon: _layoutIcon(layout),
+        iconSize: _headerIconSize,
+        value: layout,
+        onChanged: (value) => ref
+            .read(appSettingsProvider.notifier)
+            .setValue(AppSetting.browseLayout, value.name),
+        entries: [
+          for (final value in BrowseLayout.values)
+            AppDropdownEntry(
+              value: value,
+              label: _layoutLabel(value),
+              leadingBuilder: (color) =>
+                  Icon(_layoutIcon(value), size: 18, color: color),
+            ),
+        ],
+      );
+    },
+  );
+
+  IconData _layoutIcon(BrowseLayout layout) => switch (layout) {
+    BrowseLayout.cards => Icons.grid_view,
+    BrowseLayout.rows => Icons.view_list,
+  };
+
+  String _layoutLabel(BrowseLayout layout) => switch (layout) {
+    BrowseLayout.cards => 'Cards',
+    BrowseLayout.rows => 'Rows',
+  };
+
+  Widget _navigationBarContent() => LayoutBuilder(
+    builder: (context, constraints) {
+      final fullWidth = constraints.maxWidth;
+      final collapsedLeft =
+          fullWidth - _searchTrailingWidth - _searchButtonWidth;
+      final collapsedTop = _device.isMobile
+          ? (_iconRowHeight - _searchFieldHeight) / 2
+          : (_navigationBarHeight - _searchFieldHeight) / 2;
+      final expandedTop = (_navigationBarHeight - _searchFieldHeight) / 2;
+
+      return AnimatedBuilder(
+        animation: _searchExpansion,
+        builder: (context, child) {
+          final progress = _searchExpansion.value.clamp(0.0, 1.0);
+          return Stack(
+            children: [
+              if (progress < 1)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    ignoring: progress > 0,
+                    child: Opacity(
+                      opacity: 1 - progress,
+                      child: _device.isMobile
+                          ? _mobileBarRows()
+                          : _desktopBarRow(),
+                    ),
+                  ),
+                ),
+              if (progress > 0)
+                Positioned(
+                  left: collapsedLeft * (1 - progress),
+                  right: _searchTrailingWidth * (1 - progress),
+                  top: collapsedTop + (expandedTop - collapsedTop) * progress,
+                  height: _searchFieldHeight,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(40),
+                    child: progress < 1
+                        ? _collapsingSearchField()
+                        : _searchField(),
+                  ),
+                ),
+            ],
+          );
+        },
+      );
+    },
+  );
+
+  Widget _desktopBarRow() => Row(
+    children: [
+      Expanded(child: _pageViewToggle()),
+      _addButton(),
+      _searchButton(),
+      _layoutButton(),
+      _filterButton(),
+      const SizedBox(width: 12),
+      LibrarySelectorButton(size: _device.isMobile ? 32 : 40),
+      const SizedBox(width: 12),
+      UpdatifyBell(
+        isDesktop: _device.isDesktop,
+        iconSize: _device.isDesktop ? 24 : 28,
+      ),
+    ],
+  );
+
+  Widget _mobileBarRows() => Column(
+    children: [
+      SizedBox(
+        height: _iconRowHeight,
+        child: Row(
+          children: [
+            LibrarySelectorButton(
+              size: _device.isMobile ? 32 : 40,
+              showName: true,
+              maxNameWidth: _device.isMobile ? 110 : 180,
+            ),
+            const Spacer(),
+            _revealFromBell(slotsFromBell: 4, child: _addButton()),
+            _revealFromBell(slotsFromBell: 3, child: _searchButton()),
+            _revealFromBell(slotsFromBell: 2, child: _layoutButton()),
+            _revealFromBell(slotsFromBell: 1, child: _filterButton()),
+            UpdatifyBell(isDesktop: _device.isDesktop),
+          ],
+        ),
+      ),
+      const SizedBox(height: _barRowsSpacing),
+      SizedBox(
+        height: _chipsRowHeight,
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: _pageViewToggle(),
+        ),
+      ),
+    ],
+  );
+
+  double? get _headerIconSize => _device.isDesktop ? 20 : null;
+
+  Widget _searchButton() => HoverIconButton(
+    onPressed: _openSearch,
+    iconSize: _headerIconSize ?? 24,
+    color: Theme.of(context).colorScheme.onPrimary,
+    tooltip: 'Search',
+    icon: const Icon(JPlayer.search),
+  );
+
+  Widget _collapsingSearchField() => Container(
+    height: 42,
+    alignment: Alignment.centerLeft,
+    padding: const EdgeInsets.symmetric(horizontal: 12),
+    color: Colors.white.withOpacity(0.24),
+    child: const Icon(JPlayer.search),
+  );
+
+  Widget _searchField() => TextField(
+    controller: _searchController,
+    focusNode: _searchFocusNode,
+    onChanged: _onSearchChanged,
+    keyboardType: TextInputType.text,
+    textInputAction: TextInputAction.search,
+    style: const TextStyle(fontSize: 16, height: 1.2),
+    decoration: InputDecoration(
+      filled: true,
+      fillColor: Colors.white.withOpacity(0.24),
+      isDense: true,
+      contentPadding: const EdgeInsets.all(9),
+      border: OutlineInputBorder(
+        borderSide: BorderSide.none,
+        borderRadius: BorderRadius.circular(40),
+      ),
+      prefixIcon: const Icon(JPlayer.search),
+      suffixIcon: IconButton(
+        onPressed: () {
+          if (_searchController.text.isEmpty) {
+            _closeSearch();
+          } else {
+            _searchController.clear();
+            _onSearchChanged('');
+          }
+        },
+        padding: EdgeInsets.zero,
+        icon: const Icon(JPlayer.close),
+      ),
+      hintText: 'Search',
+    ),
+  );
+
+  Widget _addButton() => ValueListenableBuilder(
+    valueListenable: _currentView,
+    builder: (context, currentView, child) => AnimatedSwitcher(
+      duration: const Duration(milliseconds: 100),
+      transitionBuilder: (child, animation) => ScaleTransition(
+        scale: animation,
+        child: child,
+      ),
+      child: switch (currentView) {
+        ItemList.playlists => HoverIconButton(
+          onPressed: _onCreateNewPlaylist,
+          iconSize: _headerIconSize ?? 24,
+          color: Theme.of(context).colorScheme.onPrimary,
+          tooltip: 'New playlist',
+          icon: const Icon(Icons.add),
+        ),
+        _ => const SizedBox.shrink(),
+      },
+    ),
+  );
+}

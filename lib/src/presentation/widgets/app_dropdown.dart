@@ -1,0 +1,176 @@
+import 'dart:math';
+
+import 'package:dropdown_button2/dropdown_button2.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:jplayer/src/presentation/widgets/hover_zoom.dart';
+import 'package:jplayer/src/providers/color_scheme_provider.dart';
+
+class AppDropdownEntry<T> {
+  const AppDropdownEntry({
+    required this.value,
+    required this.label,
+    this.leadingBuilder,
+    this.trailingBuilder,
+    this.enabled = true,
+  }) : isHeader = false;
+
+  const AppDropdownEntry.header({
+    required this.value,
+    required this.label,
+    this.leadingBuilder,
+    this.trailingBuilder,
+  }) : enabled = false,
+       isHeader = true;
+
+  final T value;
+  final String label;
+  final bool enabled;
+  final bool isHeader;
+  final Widget Function(Color color)? leadingBuilder;
+  final Widget Function(Color color)? trailingBuilder;
+}
+
+class AppDropdown<T> extends StatefulWidget {
+  const AppDropdown({
+    required this.value,
+    required this.entries,
+    required this.onChanged,
+    this.icon,
+    this.buttonBuilder,
+    this.iconSize,
+    this.width = 150,
+    super.key,
+  }) : assert(
+         (icon == null) != (buttonBuilder == null),
+         'Provide either an icon or a buttonBuilder, not both',
+       );
+
+  final T? value;
+  final List<AppDropdownEntry<T>> entries;
+  final ValueChanged<T> onChanged;
+  final IconData? icon;
+  final Widget Function(bool isOpened)? buttonBuilder;
+  final double? iconSize;
+  final double width;
+
+  @override
+  State<AppDropdown<T>> createState() => _AppDropdownState<T>();
+}
+
+class _AppDropdownState<T> extends State<AppDropdown<T>> {
+  var _isOpened = false;
+
+  Widget _button(ThemeData theme) {
+    if (widget.buttonBuilder case final builder?) return builder(_isOpened);
+    return HoverZoom(
+      builder: (context, hovered) => Consumer(
+        builder: (context, ref, _) => Padding(
+          padding: const EdgeInsets.all(8),
+          child: Icon(
+            widget.icon,
+            size: widget.iconSize,
+            color: _isOpened || hovered
+                ? ref.watch(accentColorProvider)
+                : theme.iconTheme.color,
+          ),
+        ),
+      ),
+    );
+  }
+
+  double _fitWidth(BuildContext context, ThemeData theme) {
+    final scaler = MediaQuery.textScalerOf(context);
+    final base = theme.textTheme.bodyMedium ?? const TextStyle();
+    var widest = 0.0;
+    var leading = 0.0;
+    var trailing = 0.0;
+    for (final entry in widget.entries) {
+      final painter = TextPainter(
+        text: TextSpan(
+          text: entry.label,
+          style: base.copyWith(
+            fontSize: entry.isHeader ? 12 : 14,
+            fontWeight: entry.isHeader ? FontWeight.w600 : null,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+        textScaler: scaler,
+      )..layout();
+      widest = max(widest, painter.width);
+      painter.dispose();
+      if (entry.leadingBuilder != null) leading = 32;
+      if (entry.trailingBuilder != null) trailing = 24;
+    }
+    return max(widget.width, widest + leading + trailing + 52);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return DropdownButtonHideUnderline(
+      child: DropdownButton2<T>(
+        customButton: _button(theme),
+        buttonStyleData: const ButtonStyleData(
+          overlayColor: WidgetStatePropertyAll(Colors.transparent),
+        ),
+        dropdownStyleData: DropdownStyleData(
+          width: _fitWidth(context, theme),
+          padding: const EdgeInsets.all(8),
+          offset: const Offset(0, -8),
+          maxHeight: 480,
+          decoration: BoxDecoration(borderRadius: BorderRadius.circular(6)),
+        ),
+        items: [
+          for (final entry in widget.entries)
+            DropdownMenuItem(
+              value: entry.value,
+              enabled: entry.enabled,
+              child: Builder(
+                builder: (context) {
+                  final color = entry.isHeader
+                      ? theme.colorScheme.onPrimary.withValues(alpha: 0.6)
+                      : entry.value == widget.value
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.onPrimary;
+                  return Row(
+                    children: [
+                      if (entry.leadingBuilder case final builder?) ...[
+                        builder(color),
+                        const SizedBox(width: 8),
+                      ],
+                      Expanded(
+                        child: Text(
+                          entry.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: entry.isHeader ? 12 : 14,
+                            fontWeight: entry.isHeader ? FontWeight.w600 : null,
+                            height: 1.2,
+                            color: color,
+                          ),
+                        ),
+                      ),
+                      if (entry.trailingBuilder case final builder?)
+                        builder(color),
+                    ],
+                  );
+                },
+              ),
+            ),
+        ],
+        value: widget.value,
+        onChanged: (value) {
+          if (value == null) return;
+          widget.onChanged(value);
+        },
+        onMenuStateChange: (isOpened) {
+          if (!mounted) return;
+          setState(() => _isOpened = isOpened);
+        },
+      ),
+    );
+  }
+}
