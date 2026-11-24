@@ -10,6 +10,30 @@ import urllib.request
 
 
 class BridgeTests(unittest.TestCase):
+    def test_specialist_results_do_not_wait_for_general_indexers(self):
+        self.bridge.config['preferred_audiobook_indexer_ids'] = [5]
+        self.bridge.config['fallback_audiobook_indexer_ids'] = [1]
+        self.bridge.prowlarr = Mock(return_value=[{'title': 'A book', 'protocol': 'torrent', 'size': 2000}])
+        self.assertEqual(self.bridge.releases('A book')[0]['title'], 'A book')
+        self.bridge.prowlarr.assert_called_once()
+        self.assertIn('indexerIds=5', self.bridge.prowlarr.call_args.args[0])
+        self.assertEqual(self.bridge.prowlarr.call_args.kwargs['timeout'], 18)
+
+    def test_general_source_is_only_fallback_for_missing_or_failed_specialist(self):
+        self.bridge.config['preferred_audiobook_indexer_ids'] = [5]
+        self.bridge.config['fallback_audiobook_indexer_ids'] = [1]
+        for first in [[], TimeoutError()]:
+            self.bridge.prowlarr = Mock(side_effect=[first, [{'title': 'Fallback', 'protocol': 'torrent', 'size': 2000}]])
+            self.assertEqual(self.bridge.releases('A book')[0]['title'], 'Fallback')
+            self.assertEqual(self.bridge.prowlarr.call_count, 2)
+            self.assertIn('indexerIds=1', self.bridge.prowlarr.call_args.args[0])
+
+    def test_failed_sources_are_not_reported_as_confirmed_absence(self):
+        self.bridge.config['preferred_audiobook_indexer_ids'] = [5]
+        self.bridge.prowlarr = Mock(side_effect=TimeoutError())
+        with self.assertRaises(Problem):
+            self.bridge.releases('A book')
+
     def test_hash_identity_is_stable_for_torrent_and_magnet(self):
         info = b'd4:name4:book6:lengthi123ee'
         expected = hashlib.sha1(info).hexdigest()

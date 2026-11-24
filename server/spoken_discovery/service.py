@@ -264,19 +264,41 @@ class Bridge:
                  'source': 'Internet Archive · LibriVox', '_archive': x['identifier']}
                 for x in data.get('response', {}).get('docs', []) if x.get('identifier')]
 
-    def prowlarr(self, path):
+    def prowlarr(self, path, timeout=55):
         key = ET.parse(self.config['prowlarr_config']).getroot().findtext('ApiKey')
-        return json.loads(fetch(self.config['prowlarr'].rstrip('/') + path, headers={'X-Api-Key': key}, timeout=55))
+        return json.loads(fetch(self.config['prowlarr'].rstrip('/') + path, headers={'X-Api-Key': key}, timeout=timeout))
 
-    def releases(self, query):
-        if not query:
-            return []
-        rows = self.prowlarr('/api/v1/search?' + parse.urlencode({'query': query, 'categories': 3030, 'type': 'search'}))
-        return [{'kind': 'release', 'title': x.get('title', 'Audiobook'), 'author': '', 'image': None,
+    @staticmethod
+    def release_rows(rows):
+        return [{'kind': 'release', 'title': x.get('title', 'Audiobook'), 'author': '', 'image': x.get('posterUrl'),
                  'source': x.get('indexer', 'Indexer'), 'bytes': x.get('size', 0),
                  'seeders': x.get('seeders', 0), '_release': x}
                 for x in rows if str(x.get('protocol', '')).lower() == 'torrent'
                 and 0 < int(x.get('size', 0)) <= MAX_BOOK][:50]
+
+    def releases(self, query):
+        if not query:
+            return []
+        preferred = self.config.get('preferred_audiobook_indexer_ids', [])
+        if not preferred:
+            path = '/api/v1/search?' + parse.urlencode({'query': query, 'categories': 3030, 'type': 'search'})
+            return self.release_rows(self.prowlarr(path))
+        groups = [preferred, self.config.get('fallback_audiobook_indexer_ids', [])]
+        failed = False
+        for ids in groups:
+            if not ids:
+                continue
+            params = [('query', query), ('categories', 3030), ('type', 'search')]
+            params.extend(('indexerIds', int(ident)) for ident in ids)
+            try:
+                rows = self.release_rows(self.prowlarr('/api/v1/search?' + parse.urlencode(params), timeout=18))
+                if rows:
+                    return rows
+            except Exception:
+                failed = True
+        if failed:
+            raise Problem('An audiobook source is unavailable; try again shortly.', 502)
+        return []
 
     def search(self, owner, category, query):
         if category not in ('podcasts', 'audiobooks') or not isinstance(query, str) or len(query) > 160:

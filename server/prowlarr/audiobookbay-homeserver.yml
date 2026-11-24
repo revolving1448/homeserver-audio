@@ -1,0 +1,81 @@
+---
+id: audiobookbay-homeserver
+name: AudioBookBay (HomeServer)
+description: Public audiobook catalogue via its normal HTML pages
+language: en-US
+type: public
+encoding: UTF-8
+requestDelay: 2
+links:
+  - https://audiobookbay.lu/
+caps:
+  categorymappings:
+    - {id: "audiobook", cat: Audio/Audiobook, desc: Audiobooks}
+  modes:
+    search: [q]
+    book-search: [q]
+settings: []
+download:
+  infohash:
+    hash:
+      selector: td:contains("Info Hash:") ~ td
+      filters:
+        - name: regexp
+          args: "([A-Fa-f0-9]{40})"
+    title:
+      selector: div.postTitle h1, div.postTitle h2
+      filters:
+        - name: trim
+        - name: validfilename
+search:
+  paths:
+    - path: /
+    - path: page/2/
+  keywordsfilters:
+    - name: tolower
+  inputs:
+    s: "{{ .Keywords }}"
+  headers:
+    User-Agent: ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36"]
+  rows:
+    selector: "div#content > div.post:has(div.postTitle a)"
+    filters:
+      - name: andmatch
+  fields:
+    category:
+      text: audiobook
+    title:
+      selector: div.postTitle a
+    details:
+      selector: div.postTitle a
+      attribute: href
+    download:
+      selector: div.postTitle a
+      attribute: href
+    poster:
+      selector: div.postContent img
+      attribute: src
+      optional: true
+    date:
+      selector: div.postContent p:contains("Posted:")
+      optional: true
+      filters:
+        - name: regexp
+          args: 'Posted:\s*(\d{1,2} [A-Za-z]+ \d{4})'
+        - name: dateparse
+          args: "d MMM yyyy"
+    size:
+      selector: div.postContent p:contains("File Size:")
+      optional: true
+      default: 0
+      filters:
+        - name: regexp
+          args: 'File Size:\s*([0-9.]+\s*[KMGT]B)'
+    seeders:
+      text: 0
+    leechers:
+      text: 0
+    downloadvolumefactor:
+      text: 0
+    uploadvolumefactor:
+      text: 1
