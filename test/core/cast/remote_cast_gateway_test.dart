@@ -82,6 +82,35 @@ void main() {
       gateway.dio.close();
     },
   );
+  test('large queues bound concurrent link registrations', () async {
+    final adapter = MockHttpClientAdapter();
+    var active = 0;
+    var peak = 0;
+    when(() => adapter.fetch(any(), any(), any())).thenAnswer((_) async {
+      active++;
+      if (active > peak) peak = active;
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+      active--;
+      return ResponseBody.fromString(
+        jsonEncode({'media_url': 'https://cast.example/play?token=opaque'}),
+        200,
+        headers: {
+          Headers.contentTypeHeader: [Headers.jsonContentType],
+        },
+      );
+    });
+    final gateway = RemoteCastGateway(dio: Dio()..httpClientAdapter = adapter);
+    final results = await Future.wait([
+      for (var i = 0; i < 40; i++)
+        gateway.resolve(
+          Uri.parse('http://100.64.0.1:5274/rest/stream.view?id=$i'),
+          null,
+        ),
+    ]);
+    expect(results, hasLength(40));
+    expect(peak, inInclusiveRange(2, 4));
+    gateway.dio.close();
+  });
   test(
     'gateway failures do not include authentication or response details',
     () async {

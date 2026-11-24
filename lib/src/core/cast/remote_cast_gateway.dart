@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -22,6 +23,25 @@ class RemoteCastGateway {
             ),
           );
   final Dio dio;
+  final _lanes = List<Future<void>>.generate(4, (_) => Future<void>.value());
+  var _nextLane = 0;
+
+  Future<Response<Object?>> _mint(Uri api, Map<String, String> data) async {
+    final lane = _nextLane++ % _lanes.length;
+    final previous = _lanes[lane];
+    final done = Completer<void>();
+    _lanes[lane] = done.future;
+    await previous;
+    try {
+      return await dio.postUri<Object?>(
+        api,
+        data: data,
+        options: Options(contentType: Headers.jsonContentType),
+      );
+    } finally {
+      done.complete();
+    }
+  }
 
   Future<({Uri mediaUri, Uri? artUri})> resolve(Uri media, Uri? art) async {
     if (!needsRemoteCastGateway(media)) return (mediaUri: media, artUri: art);
@@ -37,14 +57,10 @@ class RemoteCastGateway {
         art.port == media.port &&
         art.path == '/rest/getCoverArt.view';
     try {
-      final response = await dio.postUri<Object?>(
-        privateApi,
-        data: {
-          'media_url': media.toString(),
-          if (proxyArt) 'art_url': art.toString(),
-        },
-        options: Options(contentType: Headers.jsonContentType),
-      );
+      final response = await _mint(privateApi, {
+        'media_url': media.toString(),
+        if (proxyArt) 'art_url': art.toString(),
+      });
       final data = Map<String, dynamic>.from(response.data! as Map);
       final playable = Uri.parse(data['media_url'] as String);
       if (playable.scheme != 'https' ||
