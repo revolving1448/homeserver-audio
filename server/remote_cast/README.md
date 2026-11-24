@@ -17,7 +17,7 @@ is always rewritten to loopback, redirects are rejected, and unrelated routes
 are never proxied. Upstream authentication stays in private mode0600 SQLite
 state; the speaker only gets a random token. Tokens expire after six hours,
 are scoped to one media/artwork URL, and have an owner quota. Expired tokens
-are pruned during minting. No request bodies or token-bearing URLs are logged.
+are pruned every minute and during minting, with SQLite secure deletion enabled. No request bodies or token-bearing URLs are logged.
 The service preserves byte ranges, HEAD, content length, media type and CORS.
 Thread count and upstream timeouts are bounded. Run as an unprivileged service
 with write access only to its own state. This is playback capability access,

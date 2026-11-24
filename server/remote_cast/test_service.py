@@ -34,6 +34,14 @@ class GatewayTests(unittest.TestCase):
         self.gateway.verify=Mock(side_effect=Problem('Denied',401))
         with self.assertRaises(Problem):self.gateway.mint({'media_url':self.url})
         with self.gateway.database() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM tokens').fetchone()[0],0)
+    def test_expired_authentication_is_removed_from_state(self):
+        self.gateway.mint({'media_url': self.url})
+        self.now += 61
+        self.gateway.prune()
+        with self.gateway.database() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM tokens').fetchone()[0], 0)
+            self.assertEqual(db.execute('PRAGMA secure_delete').fetchone()[0], 1)
+
     def test_bad_or_wrong_kind_tokens_are_rejected(self):
         result=self.gateway.mint({'media_url':self.url});token=parse.parse_qs(parse.urlsplit(result['media_url']).query)['token'][0]
         for candidate,kind in [('bad','audio'),(token,'art')]:

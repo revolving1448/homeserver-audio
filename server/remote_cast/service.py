@@ -40,11 +40,16 @@ class Gateway:
     @contextmanager
     def database(self):
         connection = sqlite3.connect(self.db, timeout=5)
+        connection.execute('PRAGMA secure_delete=ON')
         try:
             with connection:
                 yield connection
         finally:
             connection.close()
+
+    def prune(self):
+        with self.lock, self.database() as db:
+            db.execute('DELETE FROM tokens WHERE expires <= ?', (self.now(),))
 
     def source(self, value, kind):
         if not isinstance(value, str) or len(value) > 10000:
@@ -233,6 +238,14 @@ def main():
     os.umask(0o077)
     config = json.loads(Path(os.environ.get('HOMESERVER_CAST_CONFIG', '/etc/homeserver-remote-cast/config.json')).read_text())
     gateway = Gateway(config)
+    def prune_expired():
+        while True:
+            try:
+                gateway.prune()
+            except Exception:
+                pass
+            time.sleep(60)
+    threading.Thread(target=prune_expired, daemon=True).start()
     public = BoundedServer(('127.0.0.1', config.get('public_port', 4043)), handler(gateway))
     threading.Thread(target=public.serve_forever, daemon=True).start()
     servers = [BoundedServer((host, config.get('private_port', 4042)), handler(gateway, private=True)) for host in config['private_bind']]
