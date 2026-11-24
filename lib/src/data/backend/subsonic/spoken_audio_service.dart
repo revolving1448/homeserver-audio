@@ -26,9 +26,33 @@ class SpokenProfile {
 }
 
 class PodcastShow {
-  const PodcastShow({required this.id, required this.title, this.coverId});
+  const PodcastShow({
+    required this.id,
+    required this.title,
+    this.coverId,
+    this.feedUrl = '',
+  });
   final String id, title;
   final String? coverId;
+  final String feedUrl;
+  bool get isAudiobook {
+    final uri = Uri.tryParse(feedUrl);
+    return uri != null &&
+        (uri.host.toLowerCase() == 'librivox.org' ||
+            uri.host.toLowerCase().endsWith('.librivox.org') ||
+            uri.path.startsWith('/feeds/books/'));
+  }
+}
+
+class SpokenEpisode {
+  const SpokenEpisode({
+    required this.id,
+    required this.title,
+    required this.status,
+    this.playable,
+  });
+  final String id, title, status;
+  final LibraryItem? playable;
 }
 
 class SpokenAudioService {
@@ -80,23 +104,61 @@ class SpokenAudioService {
             id: '${x['id']}',
             title: '${x['title'] ?? 'Podcast'}',
             coverId: x['coverArt'] as String?,
+            feedUrl: x['url'] as String? ?? '',
           ),
     ];
   }
 
   Future<List<LibraryItem>> episodes(String channel) async {
+    return [
+      for (final entry in await episodeEntries(channel))
+        if (entry.playable != null) entry.playable!,
+    ];
+  }
+
+  Future<List<SpokenEpisode>> episodeEntries(
+    String channel, {
+    bool audiobook = false,
+  }) async {
     final body = await api.call('getPodcasts', {
       'id': channel,
       'includeEpisodes': true,
     });
     final channels = rows((body['podcasts'] as Map?)?['channel']);
     if (channels.isEmpty) return const [];
-    // Feed-only entries have no streamId and cannot play yet. Never enqueue them.
-    return [
+    final entries = [
       for (final x in rows(channels.first['episode']))
-        if (x['status'] == 'completed' && x['streamId'] != null)
-          item({...x, 'id': x['streamId']}, 'podcast'),
+        if (x['id'] != null)
+          SpokenEpisode(
+            id: '${x['id']}',
+            title: '${x['title'] ?? 'Episode'}',
+            status: '${x['status'] ?? 'new'}',
+            playable: x['status'] == 'completed' && x['streamId'] != null
+                ? item({
+                    ...x,
+                    'id': x['streamId'],
+                  }, audiobook ? 'book' : 'podcast')
+                : null,
+          ),
     ];
+    if (audiobook) {
+      int order(SpokenEpisode entry) =>
+          int.tryParse(
+            RegExp(
+                  r'^\s*(?:chapter\s*)?(\d+)',
+                  caseSensitive: false,
+                ).firstMatch(entry.title)?.group(1) ??
+                '',
+          ) ??
+          int.tryParse(entry.id) ??
+          0;
+      entries.sort((a, b) => order(a).compareTo(order(b)));
+    }
+    return entries;
+  }
+
+  Future<void> downloadEpisode(String id) async {
+    await api.call('downloadPodcastEpisode', {'id': id});
   }
 
   Future<List<LibraryItem>> bookRoots() async {

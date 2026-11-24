@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:jplayer/src/data/backend/subsonic/spoken_audio_service.dart';
+import 'package:jplayer/src/data/backend/subsonic/spoken_discovery_client.dart';
 import 'package:jplayer/src/data/backend/subsonic/subsonic_credentials.dart';
 import 'package:jplayer/src/data/providers/secure_storage_provider.dart';
 import 'package:jplayer/src/domain/providers/current_user_provider.dart';
@@ -81,9 +82,31 @@ final spokenAudioServiceProvider = Provider<SpokenAudioService?>((ref) {
 });
 final podcastShowsProvider = FutureProvider.autoDispose<List<PodcastShow>>(
   (ref) async =>
-      ref.watch(spokenAudioServiceProvider)?.shows() ??
-      Future.value(<PodcastShow>[]),
+      (await ref.watch(spokenAudioServiceProvider)?.shows() ?? <PodcastShow>[])
+          .where((show) => !show.isAudiobook)
+          .toList(),
 );
+final bookFeedShowsProvider = FutureProvider.autoDispose<List<PodcastShow>>(
+  (ref) async =>
+      (await ref.watch(spokenAudioServiceProvider)?.shows() ?? <PodcastShow>[])
+          .where((show) => show.isAudiobook)
+          .toList(),
+);
+final spokenEpisodeEntriesProvider = FutureProvider.autoDispose
+    .family<List<SpokenEpisode>, (String, bool)>(
+      (ref, key) async =>
+          ref
+              .watch(spokenAudioServiceProvider)
+              ?.episodeEntries(key.$1, audiobook: key.$2) ??
+          Future.value([]),
+    );
+final spokenDiscoveryClientProvider = Provider<SpokenDiscoveryClient?>((ref) {
+  final profile = ref.watch(spokenAudioSettingsProvider).valueOrNull;
+  if (profile == null) return null;
+  final client = SpokenDiscoveryClient(profile);
+  ref.onDispose(() => client.dio.close());
+  return client;
+});
 final podcastEpisodesProvider = FutureProvider.autoDispose
     .family<List<LibraryItem>, String>(
       (ref, id) async =>

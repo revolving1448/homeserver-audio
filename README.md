@@ -1,44 +1,54 @@
 # HomeServer Audio
 
-A personal Flutter audio-player fork of [JellyBox](https://github.com/avdept/JellyBoxPlayer), licensed under AGPLv3.
+A personal Flutter audio player based on [JellyBox](https://github.com/avdept/JellyBoxPlayer), licensed under AGPLv3.
+Original credits and documentation: [LICENSE](LICENSE) and [upstream README](docs/UPSTREAM_README.md).
 
-Features under development: artwork-led listening shortcuts, seed radio,
-queue handling, temporary upcoming-track cache, and separately linked spoken
-audio categories. Enter your own music/spoken server addresses and credentials
-privately in the app. No server addresses, account credentials or maintenance
-notes are included here.
+Music has artwork-led listening shortcuts, favourites, search, queue editing,
+seed radio and a temporary upcoming-track cache. History-based shelves use real
+listening history; they do not fabricate or import a YouTube recommendation model.
 
-## iPhone preview build
+Podcasts and Audiobooks have dedicated sidebar entries; phones use a Spoken tab.
+Link the spoken-audio Subsonic server once. Music keeps its account and player.
+Spoken tracks use separate identifiers, saved positions and chapter ordering.
 
-The manual `Build unsigned iPhone preview` workflow uses a standard macOS runner
-and Flutter3.47.9. It does not use Apple credentials, sign an app, or upload to
-TestFlight/App Store. Its unsigned IPA must be re-signed for the owner's device.
-This repository's first unsigned iOS compilation succeeded using Xcode 26.2.
+Discover searches the podcast directory and adds subscriptions. Select individual
+episodes to download; unfinished feed entries are not queued as playable files.
+Book discovery uses LibriVox/its Internet Archive collection and the household's
+configured Prowlarr audiobook indexers. Requests go through a private bridge to
+qBittorrent, then verified complete audio is imported into the spoken library.
+Availability depends on the actual providers and peers; not every title is available.
+See [bridge deployment and security contract](server/spoken_discovery/README.md).
 
-Free-account sideloading has renewal limits; see the installer documentation.
-Signing, installation and actual iPhone playback remain unverified. Windows casting currently supports DLNA/UPnP;
-Google Cast is implemented on iOS/Android, with device verification still needed.
+Server addresses, runtime credentials, signing keys and private maintenance notes
+are excluded from this repository. Enter your own addresses and logins in the app.
+Never commit `android/key.properties`, keystores, bridge configuration or state.
 
-Original project documentation and credits: docs/UPSTREAM_README.md and LICENSE.
+## Android / GrapheneOS
 
-## Android / GrapheneOS preview
+Application ID: `local.homeserver.audio`, separate from upstream JellyBox. Configure
+a persistent private Android signing key, then use `tool/build_homeserver_android.ps1`.
+The Pixel APK is `build/app/outputs/flutter-apk/app-arm64-v8a-release.apk`.
+Phone playback does not require Play services. Google Cast is optional and disabled
+when they are unavailable. Android 16 AOSP native decoding/advance/seek tests passed;
+physical GrapheneOS hardware playback still needs owner verification. Keep the app
+and VPN in the same Android user profile and allow their network access.
 
-The Android application ID is `local.homeserver.audio`, separate from upstream
-JellyBox. Configure a persistent private signing key in `android/key.properties`
-using the Android/Flutter release-signing documentation; keep that file and the
-keystore outside version control. `tool/build_homeserver_android.ps1` builds
-ARM64 (Pixel) and x86_64 (emulator) release APKs. The Pixel APK is
-`build/app/outputs/flutter-apk/app-arm64-v8a-release.apk`.
+## iPhone preview
 
-Phone playback uses Android's media service and does not require a Google account
-or Google Play services. Google Cast is optional and disabled when Play services
-are unavailable. On GrapheneOS, allow the app network access and configure your
-private VPN if the server requires it. Do not disable OS exploit protections.
+The manual `Build unsigned iPhone preview` workflow uses a free standard Mac runner,
+Flutter 3.47.9 and Xcode 26.2. No Apple credentials are used in CI. The unsigned IPA
+must be signed privately for the owner's phone, for example with AltStore Classic.
+Free-account signing requires periodic renewal. There is no App Store/TestFlight
+publication, widget extension or dedicated CarPlay entitlement in the personal target.
+Unsigned compilation has passed; actual iPhone playback remains unverified.
 
-Podcasts and Audiobooks are separate sidebar entries. Phones have a Spoken tab
-with both categories. Link the spoken-audio Subsonic server once in its connection
-settings. Music keeps its existing account and player. Podcasts currently list
-server subscriptions and downloaded playable episodes; audiobook browsing requires
-an audiobook folder configured on that server. This is not an unrestricted remote
-audiobook catalogue. Bookmarks retain spoken progress; music radio is not applied
-to spoken queues. Real GrapheneOS hardware playback still needs owner verification.
+## Development
+
+Build one platform at a time per checkout. After native integration tests, regenerate
+plugin registration with a normal release build rather than using `--no-pub` against
+the test's generated plugin files. Focused unit/widget and native audio tests cover
+queue changes, lyrics transitions, spoken routing, authentication and import boundaries.
+The bridge has independent stdlib tests. Verify real playback before claiming a
+platform complete. Windows supports DLNA/UPnP; Google Cast is mobile-only. The personal
+Windows preview disables Flutter semantics around the routed surface to work around
+an upstream native accessibility crash; mobile accessibility is unaffected.
