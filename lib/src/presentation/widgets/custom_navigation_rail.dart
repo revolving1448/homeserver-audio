@@ -130,10 +130,18 @@ class _CustomNavigationRailState extends State<CustomNavigationRail>
                   ),
                   SizedBox(height: widget.leadingGap),
                 ],
-                for (var index = 0; index < destinations.length; index++)
-                  _itemView(index),
-                ?widget.secondary,
-                const Spacer(),
+                Expanded(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (var index = 0; index < destinations.length; index++)
+                          _itemView(index),
+                        ?widget.secondary,
+                      ],
+                    ),
+                  ),
+                ),
                 ?trailing,
               ],
             ),

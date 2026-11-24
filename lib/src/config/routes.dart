@@ -11,6 +11,8 @@ enum Routes {
   nowPlaying('/now-playing'),
   home('/home'),
   browse('/browse'),
+  podcasts('/podcasts'),
+  audiobooks('/audiobooks'),
   album('album'),
   artist('artist'),
   catalogArtist('catalog-artist'),

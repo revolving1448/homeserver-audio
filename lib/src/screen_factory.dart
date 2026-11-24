@@ -1,14 +1,25 @@
 import 'package:flutter/cupertino.dart';
 import 'package:go_router/go_router.dart';
+import 'package:jplayer/src/data/backend/subsonic/spoken_audio_service.dart';
 import 'package:jplayer/src/core/enums/enums.dart';
 import 'package:jplayer/src/domain/models/models.dart' hide LibraryPage;
 import 'package:jplayer/src/presentation/pages/pages.dart';
+import 'package:jplayer/src/presentation/pages/spoken_audio_page.dart';
 import 'package:jplayer/src/presentation/tv/pages/tv_now_playing_page.dart';
 import 'package:optional_features/catalog.dart';
 
 class ScreenFactory {
   const ScreenFactory();
 
+  Page<void> podcastsPage(BuildContext context, GoRouterState router) =>
+      const NoTransitionPage(
+        child: SpokenAudioPage(initialCategory: SpokenCategory.podcasts),
+      );
+
+  Page<void> audiobooksPage(BuildContext context, GoRouterState router) =>
+      const NoTransitionPage(
+        child: SpokenAudioPage(initialCategory: SpokenCategory.audiobooks),
+      );
   @protected
   LibraryItem itemParam(GoRouterState router, String key) {
     final params = router.extra! as Map<String, dynamic>;

@@ -16,6 +16,8 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import com.google.android.gms.cast.LaunchOptions
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
 import java.util.concurrent.Executors
 
 /**
@@ -172,6 +174,13 @@ class CastContextMethodChannel : FlutterPlugin, MethodChannel.MethodCallHandler 
             .build()
 
     private fun setSharedInstance(arguments: Any?, result: MethodChannel.Result) {
+        // Casting is optional. GrapheneOS/AOSP phones must remain usable without
+        // Play services; do not launch a Google installation/resolution prompt.
+        if (GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(appContext)
+            != ConnectionResult.SUCCESS) {
+            result.error("CAST_UNAVAILABLE", "Google Cast requires available Google Play services", null)
+            return
+        }
         try {
             val map = arguments as HashMap<*, *>
             val optionsBuilder = CastOptions.Builder()

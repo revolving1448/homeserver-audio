@@ -414,6 +414,24 @@ class _AppState extends ConsumerState<App>
                 ),
               ],
             ),
+            StatefulShellBranch(
+              routes: [
+                GoRoute(
+                  path: Routes.podcasts.path,
+                  name: Routes.podcasts.name,
+                  pageBuilder: widget.screenFactory.podcastsPage,
+                ),
+              ],
+            ),
+            StatefulShellBranch(
+              routes: [
+                GoRoute(
+                  path: Routes.audiobooks.path,
+                  name: Routes.audiobooks.name,
+                  pageBuilder: widget.screenFactory.audiobooksPage,
+                ),
+              ],
+            ),
           ],
         ),
       ],

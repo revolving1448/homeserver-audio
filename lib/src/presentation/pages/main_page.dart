@@ -35,12 +35,17 @@ class _MainPageState extends ConsumerState<MainPage> {
   late ThemeData _theme;
   late DeviceType _device;
 
-  Set<(IconData, String)> get _menuItems => {
-    (Icons.home_outlined, 'Home'),
-    (JPlayer.play_circle_outlined, 'Browse'),
-    (JPlayer.settings, 'Settings'),
-    (JPlayer.download, 'Downloads'),
-  };
+  List<(IconData, String, int)> get _menuItems => [
+    (Icons.home_outlined, 'Home', 0),
+    (JPlayer.play_circle_outlined, 'Browse', 1),
+    if (_device.isDesktop) ...[
+      (Icons.podcasts, 'Podcasts', 4),
+      (Icons.menu_book_outlined, 'Audiobooks', 5),
+    ] else
+      (Icons.headphones_outlined, 'Spoken', 4),
+    (JPlayer.settings, 'Settings', 2),
+    (JPlayer.download, 'Downloads', 3),
+  ];
 
   Widget _collapseButton(bool collapsed) {
     return RailTooltip(
@@ -113,11 +118,12 @@ class _MainPageState extends ConsumerState<MainPage> {
   }
 
   void _navigateToItem(int index) {
+    final branchIndex = _menuItems[index].$3;
     ref.read(lyricsVisibleProvider.notifier).state = false;
-    if (index == 1) ref.read(browseTabSelectedProvider.notifier).state++;
+    if (branchIndex == 1) ref.read(browseTabSelectedProvider.notifier).state++;
     widget.shell.goBranch(
-      index,
-      initialLocation: index == widget.shell.currentIndex,
+      branchIndex,
+      initialLocation: branchIndex == widget.shell.currentIndex,
     );
   }
 
@@ -137,6 +143,9 @@ class _MainPageState extends ConsumerState<MainPage> {
   }
 
   Future<void> _maybeShowUpdates() async {
+    if (const bool.fromEnvironment('HOMESERVER_PERSONAL', defaultValue: true)) {
+      return;
+    }
     if (!mounted) return;
     final isDesktop = _device.isDesktop;
     await maybeShowUpdatifyPopup(
@@ -168,7 +177,11 @@ class _MainPageState extends ConsumerState<MainPage> {
     ref.listen<bool>(reviewPromptProvider, (_, due) {
       if (due) unawaited(_requestReview());
     });
-    final currentIndex = widget.shell.currentIndex;
+    final branchIndex = widget.shell.currentIndex;
+    final currentIndex = _menuItems.indexWhere(
+      (item) =>
+          item.$3 == (!_device.isDesktop && branchIndex == 5 ? 4 : branchIndex),
+    );
     final isOffline = ref.watch(isOfflineProvider);
     final manualOffline = ref.watch(manualOfflineProvider);
     final pluginNotice = ref.watch(visiblePluginNoticeProvider);
@@ -187,6 +200,7 @@ class _MainPageState extends ConsumerState<MainPage> {
               Visibility(
                 visible: _device.isDesktop,
                 child: CustomNavigationRail(
+                  leadingHeight: 64,
                   padding: const EdgeInsets.symmetric(
                     vertical: 30,
                     horizontal: 20,
@@ -202,11 +216,11 @@ class _MainPageState extends ConsumerState<MainPage> {
                         alignment: Alignment.centerLeft,
                         slide: 0,
                         child: Text(
-                          'JellyBox',
-                          maxLines: 1,
+                          'HomeServer\nAudio',
+                          maxLines: 2,
                           softWrap: false,
                           style: TextStyle(
-                            fontSize: 30,
+                            fontSize: 24,
                             fontWeight: FontWeight.w500,
                           ),
                         ),
