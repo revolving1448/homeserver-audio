@@ -14,6 +14,35 @@ class _Disconnected extends SpokenAudioSettings {
 
 void main() {
   for (final category in SpokenCategory.values) {
+    testWidgets('Desktop $category entry keeps its dedicated category', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(1440, 900);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final container = createProviderContainer(
+        overrides: [
+          spokenAudioSettingsProvider.overrideWith(_Disconnected.new),
+        ],
+      );
+      await tester.pumpWidget(
+        createTestApp(
+          providerContainer: container,
+          home: SpokenAudioPage(initialCategory: category),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byType(ChoiceChip), findsNothing);
+      expect(
+        find.text(
+          category == SpokenCategory.podcasts ? 'Podcasts' : 'Audiobooks',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('Connect spoken audio'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
     testWidgets(
       'Spoken entry opens $category and switches without a server change',
       (tester) async {
