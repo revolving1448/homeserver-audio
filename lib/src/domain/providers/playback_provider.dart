@@ -119,6 +119,7 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
   var _preparingQueue = false;
   var _queueGeneration = 0;
   var _queueEditsInFlight = 0;
+  TargetPlaybackState? _deferredTargetState;
   Completer<void>? _queueEditsSettled;
   var _fallingBack = false;
   var _recoveringLostCache = false;
@@ -335,11 +336,14 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
 
   void _onTargetState(TargetPlaybackState targetState) {
     _targetState = targetState;
-    // TODO: Come up with some better idea, this is shit and smells like shit
-    // This is hack which I have no idea how to do right currently. Basically it fixes issue when currenply playing song would point to wrong object right after reorder.
-    final index = _queueEditsInFlight > 0
-        ? state.currentMediaIndex
-        : targetState.currentIndex;
+    // A source replacement can emit temporary indices and completion while the
+    // native queue is between remove/insert. Reconcile its final state once the
+    // edit finishes; these intermediate events are not the end of playback.
+    if (_queueEditsInFlight > 0) {
+      _deferredTargetState = targetState;
+      return;
+    }
+    final index = targetState.currentIndex;
 
     if (targetState.status == PlaybackStatus.error) {
       _onTargetFailure();
@@ -589,6 +593,9 @@ class PlaybackNotifier extends StateNotifier<PlaybackState> {
       if (_queueEditsInFlight == 0) {
         _queueEditsSettled?.complete();
         _queueEditsSettled = null;
+        final deferred = _deferredTargetState;
+        _deferredTargetState = null;
+        if (deferred != null && mounted) _onTargetState(deferred);
       }
     }
   }

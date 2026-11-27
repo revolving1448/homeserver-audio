@@ -43,6 +43,7 @@ class LocalPlaybackTarget
       _player.currentIndexStream.distinct().listen((index) {
         _indexEventSeen = true;
         _observedPlayerIndex = index;
+        _snapshotIndexAtEvent = _player.currentIndex;
         _emit();
         _onIndexChanged(index);
       }),
@@ -112,6 +113,7 @@ class LocalPlaybackTarget
   // playback-event snapshot catches up. Use the event's index for UI identity.
   bool _indexEventSeen = false;
   int? _observedPlayerIndex;
+  int? _snapshotIndexAtEvent;
 
   bool get retryPending => _pending != null;
 
@@ -158,6 +160,9 @@ class LocalPlaybackTarget
     _attempt = 0;
     _exhausted = false;
     _wantsPlay = autoPlay;
+    _indexEventSeen = false;
+    _observedPlayerIndex = null;
+    _snapshotIndexAtEvent = null;
     debugPrint(
       '[LocalTarget] loading ${tracks.length} tracks at $initialIndex '
       '(${initialPosition.inSeconds}s, autoPlay=$autoPlay) '
@@ -301,8 +306,12 @@ class LocalPlaybackTarget
       if (_retry == null) _scheduleRetry();
       return;
     }
-    final index = _state.currentIndex ?? _appIndex(_player.currentIndex) ?? 0;
-    final position = _state.position;
+    final index = _appIndex(_resolvedPlayerIndex()) ?? _state.currentIndex ?? 0;
+    // Failure of a newly advanced source is not a drop in the previous song.
+    // Replaying its predecessor near the end can otherwise trap the queue.
+    final position = index == _state.currentIndex
+        ? _state.position
+        : Duration.zero;
     await _stopPlayer();
     if (_loading || _pending != null) return;
     _needsLoad(index, position);
@@ -792,6 +801,30 @@ class LocalPlaybackTarget
     final position = _shuffleOrder.positionOfIndex(slot);
     final pending = _pending;
     final replacesPending = pending != null && slot == _indexOf(pending);
+    final processing = _player.playerState.processingState;
+    if (!replacesPending &&
+        processing != ProcessingState.idle &&
+        processing != ProcessingState.completed &&
+        (slot == _player.currentIndex ||
+            (_indexEventSeen && slot == _observedPlayerIndex))) {
+      // Playback may advance while a queued download is being resolved. Never
+      // remove the newly playing source merely to replace its URL with a cache.
+      debugPrint('[LocalTarget] keeping current source during cache adoption');
+      return;
+    }
+    final duration = _player.duration;
+    final aboutToAdvance =
+        duration == null ||
+        duration - _player.position <= const Duration(seconds: 2);
+    if (!replacesPending &&
+        _player.playing &&
+        slot == _player.nextIndex &&
+        aboutToAdvance) {
+      // Do not race AVPlayer's handoff to an already queued next item. The
+      // cached file stays available for later; this source can finish normally.
+      debugPrint('[LocalTarget] keeping next source at the track boundary');
+      return;
+    }
     await _player.removeAudioSourceAt(slot);
     _shuffleOrder.nextInsertPosition = position;
     await _player.insertAudioSource(slot, _audioSource(track));
@@ -884,15 +917,28 @@ class LocalPlaybackTarget
             currentIndex: _holdIndex
                 ? _state.currentIndex
                 : _appIndex(
-                    _indexEventSeen
-                        ? _observedPlayerIndex
-                        : _player.currentIndex,
+                    _resolvedPlayerIndex(),
                   ),
             duration: _player.duration,
             bufferedPosition: _player.bufferedPosition,
             completed: playerState.processingState == ProcessingState.completed,
           );
     _controller.add(_state);
+  }
+
+  int? _resolvedPlayerIndex() {
+    final snapshot = _player.currentIndex;
+    if (!_indexEventSeen) return snapshot;
+    if (snapshot == _observedPlayerIndex) {
+      _snapshotIndexAtEvent = snapshot;
+    } else if (snapshot != _snapshotIndexAtEvent) {
+      // The native snapshot moved since the index callback. Follow it even if
+      // that callback was missed, instead of pinning the UI to an old event.
+      _observedPlayerIndex = snapshot;
+      _snapshotIndexAtEvent = snapshot;
+      _onIndexChanged(snapshot);
+    }
+    return _observedPlayerIndex;
   }
 
   int? _appIndex(int? slot) {

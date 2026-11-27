@@ -14,7 +14,7 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15-intel
-    timeout-minutes: 40
+    timeout-minutes: 55
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
@@ -28,6 +28,14 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+      - name: Verify automatic playback on an iPhone simulator
+        run: |
+          python3 tool/prepare_personal_ios.py
+          flutter pub get
+          SIMULATOR_ID=$(xcrun simctl list devices available --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(v["udid"] for k,items in d["devices"].items() if "iOS" in k for v in items if v["name"].startswith("iPhone") and v.get("isAvailable",True)))')
+          xcrun simctl boot "$SIMULATOR_ID" || true
+          xcrun simctl bootstatus "$SIMULATOR_ID" -b
+          flutter test integration_test/local_queue_transition_test.dart -d "$SIMULATOR_ID" --timeout 3m --dart-define=HOMESERVER_PERSONAL=true --dart-define=JELLYBOX_SIDELOAD=true
       - name: Prepare and build the personal app
         run: bash tool/build_homeserver_ios.sh
       - name: Package for free-account re-signing

@@ -311,6 +311,20 @@ void main() {
     );
   });
 
+  test('- snapshot advancement repairs a missed index event', () async {
+    reportPlayer(playing: true, processingState: ProcessingState.ready);
+    indexes.add(0);
+    await Future<void>.delayed(Duration.zero);
+    reportPlayer(
+      playing: true,
+      processingState: ProcessingState.ready,
+      index: 1,
+      position: const Duration(seconds: 1),
+    );
+    await Future<void>.delayed(Duration.zero);
+    expect(target.state.currentIndex, 1);
+  });
+
   group('load', () {
     test('- builds a progressive source with precise darwin timing', () async {
       await target.load(
@@ -1080,6 +1094,35 @@ void main() {
       });
 
       test(
+        '- a failed automatic next track retries that song from its start',
+        () async {
+          failures = 0;
+          final retrying = targetThatRetries();
+          reportPlayer(
+            playing: true,
+            processingState: ProcessingState.ready,
+            index: 0,
+            position: const Duration(seconds: 179),
+          );
+          await Future<void>.delayed(Duration.zero);
+          // Native playback moved before its index notification reached the UI.
+          when(() => player.currentIndex).thenReturn(1);
+          errors.add(PlayerException(1, 'Next source failed', 1));
+          await Future<void>.delayed(later);
+          verify(
+            () => player.setAudioSources(
+              any(),
+              initialIndex: 1,
+              initialPosition: Duration.zero,
+              preload: true,
+              shuffleOrder: any(named: 'shuffleOrder'),
+            ),
+          ).called(1);
+          expect(retrying.retryPending, isFalse);
+        },
+      );
+
+      test(
         '- a stream that drops while playing resumes where it was',
         () async {
           failures = 0;
@@ -1225,6 +1268,39 @@ void main() {
         () => player.insertAudioSource(1, any()),
       ]);
     });
+
+    test(
+      '- cache adoption never removes a source that just became current',
+      () async {
+        reportPlayer(
+          playing: true,
+          processingState: ProcessingState.ready,
+          index: 1,
+        );
+        indexes.add(1);
+        await Future<void>.delayed(Duration.zero);
+        await target.replace(1, trackWith());
+        verifyNever(() => player.removeAudioSourceAt(any()));
+        verifyNever(() => player.insertAudioSource(any(), any()));
+      },
+    );
+
+    test(
+      '- leaves the queued next source intact at the natural boundary',
+      () async {
+        reportPlayer(
+          playing: true,
+          processingState: ProcessingState.ready,
+          index: 0,
+          position: const Duration(seconds: 179),
+          duration: const Duration(minutes: 3),
+        );
+        when(() => player.nextIndex).thenReturn(1);
+        await target.replace(1, trackWith());
+        verifyNever(() => player.removeAudioSourceAt(any()));
+        verifyNever(() => player.insertAudioSource(any(), any()));
+      },
+    );
 
     test('- holds the entry in its shuffle slot', () async {
       when(() => player.shuffleModeEnabled).thenReturn(true);

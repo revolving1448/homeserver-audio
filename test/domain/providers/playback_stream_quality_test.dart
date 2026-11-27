@@ -33,6 +33,8 @@ class _FakeTarget implements PlaybackTarget, SwappableQueue {
   final loaded = <List<TargetTrack>>[];
   final replaced = <(int, TargetTrack)>[];
   var holdsCurrent = true;
+  Future<void> Function(int index)? onReplace;
+  int pauseCalls = 0;
 
   @override
   bool get holdsCurrentTrack => holdsCurrent;
@@ -94,6 +96,27 @@ class _FakeTarget implements PlaybackTarget, SwappableQueue {
   @override
   Future<void> replace(int index, TargetTrack track) async {
     replaced.add((index, track));
+    await onReplace?.call(index);
+  }
+
+  void completedAt(int index) {
+    _state = TargetPlaybackState(
+      status: PlaybackStatus.stopped,
+      position: const Duration(minutes: 3),
+      currentIndex: index,
+      completed: true,
+    );
+    _controller.add(_state);
+  }
+
+  @override
+  Future<void> pause() async {
+    pauseCalls++;
+  }
+
+  @override
+  Future<void> skipTo(int index) async {
+    moveTo(index);
   }
 
   @override
@@ -249,6 +272,53 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
   }
+
+  test(
+    '- reconciles automatic advancement that arrives during a cache swap',
+    () async {
+      final playback = container.read(playbackProvider.notifier);
+      await playback.play(songs.first, songs, album);
+      target.moveTo(0);
+      await Future<void>.delayed(Duration.zero);
+      var first = true;
+      target.onReplace = (_) async {
+        if (!first) return;
+        first = false;
+        target.moveTo(1);
+        await Future<void>.delayed(Duration.zero);
+      };
+      network.use(NetworkType.cellular);
+      await pumpUntil(() => !first && target.replaced.length >= 2);
+      expect(first, isFalse);
+      expect(container.read(playbackProvider).currentMediaIndex, 1);
+      expect(container.read(playbackProvider).status, PlaybackStatus.playing);
+    },
+  );
+
+  test(
+    '- transient completion during a source swap does not rewind the queue',
+    () async {
+      final playback = container.read(playbackProvider.notifier);
+      await playback.play(songs.first, songs, album);
+      target.moveTo(0);
+      await Future<void>.delayed(Duration.zero);
+      var first = true;
+      target.onReplace = (_) async {
+        if (!first) return;
+        first = false;
+        target.completedAt(0);
+        await Future<void>.delayed(Duration.zero);
+        target.moveTo(1);
+        await Future<void>.delayed(Duration.zero);
+      };
+      network.use(NetworkType.cellular);
+      await pumpUntil(() => !first && target.replaced.length >= 2);
+      expect(first, isFalse);
+      expect(target.pauseCalls, 0);
+      expect(container.read(playbackProvider).currentMediaIndex, 1);
+      expect(container.read(playbackProvider).status, PlaybackStatus.playing);
+    },
+  );
 
   test('- streams at the cap of the network in use', () async {
     network.use(NetworkType.cellular);
